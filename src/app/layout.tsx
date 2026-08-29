@@ -3,8 +3,8 @@ import { Manrope, Unbounded } from 'next/font/google'
 import { cookies } from 'next/headers'
 import './globals.css'
 import { AuthProvider } from '@/contexts/AuthContext'
-import { getImpersonationState } from '@/actions/auth'
-import { createClient } from '@/lib/supabase/server'
+import { getActor } from '@/lib/auth/actor'
+import { queryOne } from '@/lib/db'
 import { Toaster } from 'sonner'
 import { Employee } from '@/types'
 import { DEFAULT_ACCENT, ACCENT_COOKIE_NAME, isAccentId } from '@/lib/accent-theme'
@@ -26,6 +26,16 @@ const unbounded = Unbounded({
 
 const fontVars = `${manrope.variable} ${unbounded.variable}`
 
+// Полная карточка сотрудника для AuthProvider. Actor несёт только поля,
+// нужные для проверок прав, а контексту нужен весь Employee.
+async function loadEmployee(employeeId: string | null): Promise<Employee | null> {
+  if (!employeeId) return null
+  return queryOne<Employee>(
+    'SELECT * FROM public.employees WHERE id = $1 AND deleted_at IS NULL LIMIT 1',
+    [employeeId],
+  )
+}
+
 export const metadata: Metadata = {
   title: 'Cashflow CRM',
   description: 'Система управления бизнесом',
@@ -41,42 +51,24 @@ export default async function RootLayout({
   const accentCookie = jar.get(ACCENT_COOKIE_NAME)?.value
   const accent = isAccentId(accentCookie) ? accentCookie : DEFAULT_ACCENT
 
-  const supabase = await createClient()
-
-  // Параллельно получаем сессию и состояние impersonation.
-  const [{ data: { session } }, initialImpersonation] = await Promise.all([
-    supabase.auth.getSession(),
-    getImpersonationState(),
-  ])
+  // getActor() уже разрешает сессию, роль из БД и impersonation за один заход.
+  const actor = await getActor()
+  const initialImpersonation = actor?.impersonating ?? null
 
   let initialEmployee: Employee | null = null
   let initialRealUser: Employee | null = null
 
-  if (session?.user) {
-    const { data: emp } = await supabase
-      .from('employees')
-      .select('*')
-      .eq('user_id', session.user.id)
-      .is('deleted_at', null)
-      .single()
-
-    if (emp) {
-      const employee = emp as Employee
-
-      if (employee.role === 'owner' && initialImpersonation) {
-        // Режим impersonation: realUser = owner, user = цель impersonation.
-        const { data: targetEmp } = await supabase
-          .from('employees')
-          .select('*')
-          .eq('id', initialImpersonation.id)
-          .is('deleted_at', null)
-          .single()
-
-        initialRealUser = employee
-        initialEmployee = (targetEmp as Employee | null) ?? employee
-      } else {
-        initialEmployee = employee
-      }
+  if (actor) {
+    if (initialImpersonation) {
+      // Режим impersonation: realUser = owner, user = цель impersonation.
+      const [real, effective] = await Promise.all([
+        loadEmployee(actor.realEmployeeId),
+        loadEmployee(actor.employeeId),
+      ])
+      initialRealUser = real
+      initialEmployee = effective ?? real
+    } else {
+      initialEmployee = await loadEmployee(actor.employeeId)
     }
   }
 

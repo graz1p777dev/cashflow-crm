@@ -1,9 +1,17 @@
 'use server'
 
-import { headers } from 'next/headers'
-import { createClient } from '@/lib/supabase/server'
-import { createAdminClient } from '@/lib/supabase/admin'
+import { createHash, randomBytes } from 'node:crypto'
+import { cookies, headers } from 'next/headers'
+import { query, queryOne, transaction } from '@/lib/db'
 import { validatePassword } from '@/lib/auth-validation'
+import { hashPassword, verifyPassword, burnTime } from '@/lib/auth/password'
+import {
+  createSession,
+  destroySession,
+  getSession,
+  IMPERSONATION_COOKIE_NAME,
+} from '@/lib/auth/session'
+import { getActor, isOwner, UUID_RE, type ImpersonationInfo } from '@/lib/auth/actor'
 import { notify } from '@/lib/notifications/notify'
 
 export type ActionResult =
@@ -18,8 +26,16 @@ const MAX_FAILURES   = 5
 const BLOCK_MS       = 15 * 60 * 1000 // 15 минут
 
 // ─── signIn ───────────────────────────────────────────────────────────────────
-// Заменяет прямой вызов supabase.auth.signInWithPassword на клиенте.
+// Проверяет пароль по users.password_hash и ставит подписанную cookie-сессию.
 // Трекает неудачные попытки и блокирует аккаунт после MAX_FAILURES подряд.
+
+interface SignInRow {
+  user_id: string
+  password_hash: string | null
+  employee_id: string | null
+  role: string | null
+  must_change_password: boolean | null
+}
 
 export async function signIn(email: string, password: string): Promise<ActionResult> {
   const key = email.toLowerCase().trim()
@@ -31,12 +47,27 @@ export async function signIn(email: string, password: string): Promise<ActionRes
     return { success: false, error: `Слишком много попыток. Подождите ${minutes} мин.` }
   }
 
-  const supabase = await createClient()
-  // Получаем user прямо из ответа — не создаём второй клиент и не вызываем getSession().
-  // Второй createClient() может перезаписать session-cookies через setAll и сломать авторизацию.
-  const { data: { user }, error } = await supabase.auth.signInWithPassword({ email, password })
+  const row = await queryOne<SignInRow>(
+    `SELECT u.id            AS user_id,
+            u.password_hash AS password_hash,
+            e.id            AS employee_id,
+            e.role          AS role,
+            e.must_change_password
+       FROM public.users u
+       LEFT JOIN public.employees e
+         ON e.user_id = u.id AND e.deleted_at IS NULL
+      WHERE lower(u.email) = $1
+      LIMIT 1`,
+    [key],
+  )
 
-  if (error) {
+  // Пароль сверяем всегда — даже когда email неизвестен, иначе по времени
+  // ответа можно отличить существующий адрес от несуществующего.
+  const passwordOk = row
+    ? await verifyPassword(password, row.password_hash)
+    : await burnTime(password).then(() => false)
+
+  if (!row || !passwordOk) {
     const failures = (record?.failures ?? 0) + 1
     if (failures >= MAX_FAILURES) {
       loginAttempts.set(key, { failures, blockedUntil: now + BLOCK_MS })
@@ -52,19 +83,20 @@ export async function signIn(email: string, password: string): Promise<ActionRes
 
   loginAttempts.delete(key)
 
-  // Проверяем must_change_password через тот же клиент — user.id уже известен из signInWithPassword
-  if (user) {
-    const { data: emp } = await supabase
-      .from('employees')
-      .select('must_change_password')
-      .eq('user_id', user.id)
-      .single()
-    if (emp?.must_change_password) {
-      return { success: true, mustChangePassword: true }
-    }
-  }
+  await createSession({
+    uid:  row.user_id,
+    eid:  row.employee_id,
+    role: row.role ?? 'mp',
+  })
 
-  return { success: true, mustChangePassword: false }
+  return { success: true, mustChangePassword: row.must_change_password === true }
+}
+
+// ─── signOut ──────────────────────────────────────────────────────────────────
+
+export async function signOut(): Promise<ActionResult> {
+  await destroySession()
+  return { success: true }
 }
 
 // ─── Вспомогательная: получить origin из запроса ─────────────────────────────
@@ -76,80 +108,128 @@ async function getSiteOrigin(): Promise<string> {
   return `${proto}://${host}`
 }
 
-// ─── Проверка: только owner может управлять пользователями ───────────────────
+// Проверка «только owner» живёт в @/lib/auth/actor как isOwner(): смотрит на
+// настоящую роль из БД, поэтому owner в режиме impersonation прав не теряет,
+// а подделанная cookie impersonate_as прав не даёт.
 
-async function requireOwner(): Promise<boolean> {
-  const supabase = await createClient()
-  const { data: { session } } = await supabase.auth.getSession()
-  if (!session) return false
-  const { data } = await supabase
-    .from('employees')
-    .select('role')
-    .eq('user_id', session.user.id)
-    .single()
-  return data?.role === 'owner'
+// ─── Токены сброса пароля ─────────────────────────────────────────────────────
+// В БД лежит только SHA-256 от токена: утечка таблицы не даёт рабочих ссылок.
+// Токен высокоэнтропийный (32 случайных байта), поэтому растягивать его bcrypt
+// незачем — а простой дайджест позволяет искать по индексу.
+
+const RESET_TOKEN_TTL_MS = 60 * 60 * 1000 // 1 час
+
+function hashToken(token: string): string {
+  return createHash('sha256').update(token).digest('hex')
 }
 
 // ─── requestPasswordReset ─────────────────────────────────────────────────────
-// Отправляет письмо со ссылкой для сброса пароля.
+// Создаёт одноразовый токен со сроком жизни и возвращает ссылку для сброса.
 // Доступно без авторизации (пользователь вышел или забыл пароль).
 
-export async function requestPasswordReset(email: string): Promise<ActionResult> {
+export type ResetRequestResult =
+  | { success: true; resetUrl?: string }
+  | { success: false; error: string }
+
+export async function requestPasswordReset(email: string): Promise<ResetRequestResult> {
   if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return { success: false, error: 'Укажите корректный email' }
   }
 
-  const supabase = await createClient()
-  const origin   = await getSiteOrigin()
+  const user = await queryOne<{ id: string }>(
+    'SELECT id FROM public.users WHERE lower(email) = $1 LIMIT 1',
+    [email.toLowerCase().trim()],
+  )
 
-  const { error } = await supabase.auth.resetPasswordForEmail(email, {
-    // Callback обменивает code → session на сервере (ставит cookie),
-    // затем редиректит на страницу ввода нового пароля
-    redirectTo: `${origin}/auth/callback?next=/auth/reset-password`,
+  // Не раскрываем, существует ли email — success в любом случае,
+  // чтобы форму нельзя было использовать для перебора адресов.
+  if (!user) return { success: true }
+
+  const token = randomBytes(32).toString('base64url')
+  const expiresAt = new Date(Date.now() + RESET_TOKEN_TTL_MS)
+
+  // Прежние невыданные токены гасим: одна живая ссылка на пользователя.
+  await transaction(async (client) => {
+    await client.query(
+      `UPDATE public.password_reset_tokens
+          SET used_at = NOW()
+        WHERE user_id = $1 AND used_at IS NULL`,
+      [user.id],
+    )
+    await client.query(
+      `INSERT INTO public.password_reset_tokens (user_id, token_hash, expires_at)
+       VALUES ($1, $2, $3)`,
+      [user.id, hashToken(token), expiresAt],
+    )
   })
 
-  if (error) {
-    console.error('[requestPasswordReset]', error.message)
-    // Не раскрываем существует ли email — возвращаем success в любом случае
-    // чтобы не давать возможность перебирать email-адреса
-  }
+  const resetUrl = `${await getSiteOrigin()}/auth/reset-password?token=${token}`
 
-  return { success: true }
+  // TODO(email): транзакционного провайдера ещё нет — Supabase присылал письма
+  // сам, замену (Resend / Postmark / SMTP) нужно выбрать и подключить
+  // (db/AUTH_DESIGN.md §1, открытый вопрос 7). До тех пор ссылка возвращается
+  // вызывающему коду, чтобы её можно было передать сотруднику вручную.
+  //
+  // Когда провайдер появится — отправлять письмо здесь и ПЕРЕСТАТЬ возвращать
+  // resetUrl наружу: сейчас его получает тот, кто отправил форму, а значит
+  // любой, кто знает чужой email, может запросить ссылку на него.
+  console.warn(`[requestPasswordReset] нет отправки почты; ссылка: ${resetUrl}`)
+
+  return { success: true, resetUrl }
 }
 
 // ─── confirmPasswordReset ─────────────────────────────────────────────────────
-// Устанавливает новый пароль для текущего залогиненного пользователя.
-// Вызывается ПОСЛЕ того как клиент обменял recovery-код на сессию.
+// Проверяет токен, меняет пароль и гасит токен. Авторизации не требует —
+// доказательством личности служит сам токен.
 
-export async function confirmPasswordReset(newPassword: string): Promise<ActionResult> {
+export async function confirmPasswordReset(
+  token: string,
+  newPassword: string,
+): Promise<ActionResult> {
+  if (!token) return { success: false, error: 'Ссылка недействительна. Запросите новую.' }
+
   const err = validatePassword(newPassword)
   if (err) return { success: false, error: err }
 
-  const supabase = await createClient()
-  const { data: { session } } = await supabase.auth.getSession()
-  if (!session) return { success: false, error: 'Сессия недействительна. Запросите ссылку повторно.' }
+  const row = await queryOne<{ id: string; user_id: string }>(
+    `SELECT id, user_id
+       FROM public.password_reset_tokens
+      WHERE token_hash = $1
+        AND used_at IS NULL
+        AND expires_at > NOW()
+      LIMIT 1`,
+    [hashToken(token)],
+  )
 
-  const { error } = await supabase.auth.updateUser({ password: newPassword })
-  if (error) {
-    console.error('[confirmPasswordReset]', error.message)
-    return { success: false, error: 'Не удалось обновить пароль. Попробуйте ещё раз.' }
+  if (!row) {
+    return { success: false, error: 'Ссылка недействительна или устарела. Запросите новую.' }
   }
 
-  // Завершаем все сессии пользователя на других устройствах.
-  // scope:'others' оставляет текущую сессию активной (пользователь остаётся в системе).
-  const admin = createAdminClient()
-  try {
-    await admin.auth.admin.signOut(session.access_token, 'others')
-  } catch (e) {
-    // Не критично — пароль уже сменён, логируем и продолжаем
-    console.warn('[confirmPasswordReset] signOut others:', e)
-  }
+  const hash = await hashPassword(newPassword)
+
+  // Пароль и гашение токена — одной транзакцией: иначе при сбое между ними
+  // ссылка осталась бы рабочей при уже сменённом пароле.
+  await transaction(async (client) => {
+    await client.query(
+      'UPDATE public.users SET password_hash = $1 WHERE id = $2',
+      [hash, row.user_id],
+    )
+    await client.query(
+      'UPDATE public.password_reset_tokens SET used_at = NOW() WHERE id = $1',
+      [row.id],
+    )
+    // Сброс пароля закрывает и принудительную смену: пароль уже новый.
+    await client.query(
+      'UPDATE public.employees SET must_change_password = false WHERE user_id = $1',
+      [row.user_id],
+    )
+  })
 
   return { success: true }
 }
 
 // ─── createAuthUser ───────────────────────────────────────────────────────────
-// Создаёт пользователя в auth.users через service role key.
+// Создаёт запись в public.users и привязывает её к сотруднику.
 // Только owner. Используется из createEmployee.
 
 export async function createAuthUser(
@@ -157,68 +237,68 @@ export async function createAuthUser(
   password: string,
   employeeId: string,
 ): Promise<ActionResult> {
-  if (!await requireOwner()) return { success: false, error: 'Недостаточно прав' }
+  if (!await isOwner()) return { success: false, error: 'Недостаточно прав' }
+  if (!UUID_RE.test(employeeId)) return { success: false, error: 'Некорректный идентификатор' }
 
   const pwErr = validatePassword(password)
   if (pwErr) return { success: false, error: pwErr }
 
-  const admin = createAdminClient()
+  const normalized = email.toLowerCase().trim()
 
-  // Проверяем — вдруг уже есть
-  const { data: existing } = await admin.auth.admin.listUsers()
-  const alreadyExists = existing?.users?.find(u => u.email === email)
-  if (alreadyExists) {
-    // Привязываем существующего к employee
-    const { error: linkErr } = await admin
-      .from('employees')
-      .update({ user_id: alreadyExists.id })
-      .eq('id', employeeId)
-    if (linkErr) return { success: false, error: 'Ошибка привязки аккаунта' }
+  try {
+    const existing = await queryOne<{ id: string }>(
+      'SELECT id FROM public.users WHERE lower(email) = $1 LIMIT 1',
+      [normalized],
+    )
+
+    // Аккаунт уже есть — просто привязываем к сотруднику, пароль не трогаем.
+    if (existing) {
+      await query(
+        'UPDATE public.employees SET user_id = $1 WHERE id = $2',
+        [existing.id, employeeId],
+      )
+      return { success: true }
+    }
+
+    const hash = await hashPassword(password)
+
+    // Вставка пользователя и привязка — одной транзакцией: осиротевший
+    // users-ряд без сотрудника занял бы email и сломал повторную попытку.
+    await transaction(async (client) => {
+      const inserted = await client.query<{ id: string }>(
+        'INSERT INTO public.users (email, password_hash) VALUES ($1, $2) RETURNING id',
+        [normalized, hash],
+      )
+      await client.query(
+        'UPDATE public.employees SET user_id = $1 WHERE id = $2',
+        [inserted.rows[0].id, employeeId],
+      )
+    })
+
     return { success: true }
-  }
-
-  // Создаём нового пользователя в auth.users
-  const { data: created, error: createErr } = await admin.auth.admin.createUser({
-    email,
-    password,
-    email_confirm: true,   // сразу подтверждаем email, не ждём подтверждения
-  })
-
-  if (createErr || !created?.user) {
-    console.error('[createAuthUser]', createErr?.message)
+  } catch (e) {
+    console.error('[createAuthUser]', e instanceof Error ? e.message : e)
     return { success: false, error: 'Ошибка создания аккаунта' }
   }
-
-  // Привязываем auth.users.id → employees.user_id
-  const { error: linkErr } = await admin
-    .from('employees')
-    .update({ user_id: created.user.id })
-    .eq('id', employeeId)
-
-  if (linkErr) {
-    console.error('[createAuthUser] link error', linkErr.message)
-    // Откатываем — удаляем только что созданного пользователя
-    await admin.auth.admin.deleteUser(created.user.id)
-    return { success: false, error: 'Ошибка привязки аккаунта к сотруднику' }
-  }
-
-  return { success: true }
 }
 
 // ─── deleteAuthUser ───────────────────────────────────────────────────────────
-// Удаляет пользователя из auth.users при архивации сотрудника.
+// Удаляет аккаунт при архивации сотрудника.
+// employees.user_id — ON DELETE SET NULL, поэтому сама карточка сотрудника
+// остаётся: история, зарплаты и логи на неё ссылаются.
 // Только owner.
 
 export async function deleteAuthUser(userId: string): Promise<ActionResult> {
-  if (!await requireOwner()) return { success: false, error: 'Недостаточно прав' }
+  if (!await isOwner()) return { success: false, error: 'Недостаточно прав' }
+  if (!UUID_RE.test(userId)) return { success: false, error: 'Некорректный идентификатор' }
 
-  const admin = createAdminClient()
-  const { error } = await admin.auth.admin.deleteUser(userId)
-  if (error) {
-    console.error('[deleteAuthUser]', error.message)
+  try {
+    await query('DELETE FROM public.users WHERE id = $1', [userId])
+    return { success: true }
+  } catch (e) {
+    console.error('[deleteAuthUser]', e instanceof Error ? e.message : e)
     return { success: false, error: 'Ошибка удаления аккаунта' }
   }
-  return { success: true }
 }
 
 // ─── changePasswordForce ──────────────────────────────────────────────────────
@@ -229,34 +309,36 @@ export async function changePasswordForce(newPassword: string): Promise<ActionRe
   const err = validatePassword(newPassword)
   if (err) return { success: false, error: err }
 
-  const supabase = await createClient()
-  const { data: { session } } = await supabase.auth.getSession()
+  const session = await getSession()
   if (!session) return { success: false, error: 'Сессия недействительна. Войдите заново.' }
 
-  const { error: pwErr } = await supabase.auth.updateUser({ password: newPassword })
-  if (pwErr) {
-    console.error('[changePasswordForce] updateUser:', pwErr.message)
+  const hash = await hashPassword(newPassword)
+
+  let employeeName: string | null
+  try {
+    employeeName = await transaction(async (client) => {
+      await client.query(
+        'UPDATE public.users SET password_hash = $1 WHERE id = $2',
+        [hash, session.uid],
+      )
+      const emp = await client.query<{ name: string }>(
+        `UPDATE public.employees
+            SET must_change_password = false
+          WHERE user_id = $1
+          RETURNING name`,
+        [session.uid],
+      )
+      return emp.rows[0]?.name ?? null
+    })
+  } catch (e) {
+    console.error('[changePasswordForce]', e instanceof Error ? e.message : e)
     return { success: false, error: 'Не удалось обновить пароль. Попробуйте ещё раз.' }
-  }
-
-  // Снимаем флаг через admin (обходим RLS — пользователь не имеет права писать сам себе этот флаг)
-  const admin = createAdminClient()
-  const { data: emp, error: flagErr } = await admin
-    .from('employees')
-    .update({ must_change_password: false })
-    .eq('user_id', session.user.id)
-    .select('name')
-    .single()
-
-  if (flagErr) {
-    console.error('[changePasswordForce] flag clear:', flagErr.message)
-    // Не фатально — пароль уже сменён, флаг попробуем сбросить при следующем входе
   }
 
   void notify({
     type: 'security',
     title: 'Пароль аккаунта изменён',
-    body: emp?.name ? `Сотрудник «${emp.name}» сменил пароль` : 'Пароль сотрудника изменён',
+    body: employeeName ? `Сотрудник «${employeeName}» сменил пароль` : 'Пароль сотрудника изменён',
     isImportant: true,
   })
 
@@ -265,8 +347,8 @@ export async function changePasswordForce(newPassword: string): Promise<ActionRe
 
 // ─── updateOwnProfile ──────────────────────────────────────────────────────────
 // Пользователь редактирует свои контактные данные (имя, телефон, email).
-// Не трогает auth.users.email (вход в систему) — это отдельная сущность,
-// требующая подтверждения по почте, а SMTP на проде не настроен (см. HANDOFF.md §3).
+// Не трогает users.email (вход в систему) — это отдельная сущность,
+// требующая подтверждения по почте, а почтовый провайдер пока не подключён.
 
 export type UpdateProfileResult =
   | { success: true; employee: { name: string; phone: string | null; email: string } }
@@ -286,18 +368,18 @@ export async function updateOwnProfile(fields: {
     return { success: false, error: 'Укажите корректный email' }
   }
 
-  const supabase = await createClient()
-  const { data: { session } } = await supabase.auth.getSession()
+  const session = await getSession()
   if (!session) return { success: false, error: 'Сессия недействительна. Войдите заново.' }
 
-  const admin = createAdminClient()
-  const { error } = await admin
-    .from('employees')
-    .update({ name, phone: phone || null, email })
-    .eq('user_id', session.user.id)
-
-  if (error) {
-    console.error('[updateOwnProfile]', error.message)
+  try {
+    await query(
+      `UPDATE public.employees
+          SET name = $1, phone = $2, email = $3
+        WHERE user_id = $4`,
+      [name, phone || null, email, session.uid],
+    )
+  } catch (e) {
+    console.error('[updateOwnProfile]', e instanceof Error ? e.message : e)
     return { success: false, error: 'Не удалось сохранить изменения' }
   }
 
@@ -311,99 +393,83 @@ export async function changeOwnPassword(newPassword: string): Promise<ActionResu
   const err = validatePassword(newPassword)
   if (err) return { success: false, error: err }
 
-  const supabase = await createClient()
-  const { data: { session } } = await supabase.auth.getSession()
+  const session = await getSession()
   if (!session) return { success: false, error: 'Сессия недействительна. Войдите заново.' }
 
-  const { error } = await supabase.auth.updateUser({ password: newPassword })
-  if (error) {
-    console.error('[changeOwnPassword]', error.message)
+  const hash = await hashPassword(newPassword)
+
+  try {
+    await query(
+      'UPDATE public.users SET password_hash = $1 WHERE id = $2',
+      [hash, session.uid],
+    )
+  } catch (e) {
+    console.error('[changeOwnPassword]', e instanceof Error ? e.message : e)
     return { success: false, error: 'Не удалось обновить пароль. Попробуйте ещё раз.' }
   }
 
   return { success: true }
 }
 
-// ─── UUID-валидация ───────────────────────────────────────────────────────────
-
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-
 // ─── getImpersonationState ────────────────────────────────────────────────────
 // Читает cookie impersonate_as (httpOnly) на сервере.
 // Возвращает данные сотрудника из БД — никогда не доверяет содержимому cookie.
-// Если employeeId не существует в БД — автоматически удаляет cookie.
 
-export async function getImpersonationState(): Promise<{ id: string; name: string; role: string } | null> {
-  const { cookies } = await import('next/headers')
-  const jar = await cookies()
-  const employeeId = jar.get('impersonate_as')?.value
-
-  if (!employeeId) return null
-
-  // Защита от подделки: принимаем только корректный UUID
-  if (!UUID_RE.test(employeeId)) {
-    jar.delete('impersonate_as')
-    return null
-  }
-
-  // Права и имя — только из БД, cookie хранит лишь ID
-  const admin = createAdminClient()
-  const { data: emp } = await admin
-    .from('employees')
-    .select('id, name, role')
-    .eq('id', employeeId)
-    .is('deleted_at', null)
-    .single()
-
-  if (!emp) {
-    // Несуществующий или удалённый сотрудник — сбрасываем сессию
-    jar.delete('impersonate_as')
-    return null
-  }
-
-  return { id: emp.id, name: emp.name, role: emp.role }
+export async function getImpersonationState(): Promise<ImpersonationInfo | null> {
+  const actor = await getActor()
+  return actor?.impersonating ?? null
 }
 
 // ─── startImpersonation ───────────────────────────────────────────────────────
 // Владелец входит «от имени» сотрудника.
 // Cookie хранит ТОЛЬКО UUID сотрудника. httpOnly: true — JS не может прочитать.
 
+interface ImpersonationTargetRow {
+  id: string
+  name: string
+  email: string
+  role: string
+}
+
 export async function startImpersonation(employeeId: string): Promise<ActionResult> {
   if (!UUID_RE.test(employeeId)) return { success: false, error: 'Некорректный идентификатор' }
 
-  const supabase = await createClient()
-  const { data: { session } } = await supabase.auth.getSession()
-  if (!session) return { success: false, error: 'Не авторизован' }
+  const actor = await getActor()
+  if (!actor) return { success: false, error: 'Не авторизован' }
+  if (actor.realRole !== 'owner') return { success: false, error: 'Недостаточно прав' }
 
-  const admin = createAdminClient()
+  const target = await queryOne<ImpersonationTargetRow>(
+    `SELECT id, name, email, role
+       FROM public.employees
+      WHERE id = $1 AND deleted_at IS NULL
+      LIMIT 1`,
+    [employeeId],
+  )
 
-  // Параллельно проверяем owner-роль и загружаем данные цели — экономим один round-trip
-  const [selfResult, targetResult] = await Promise.all([
-    supabase.from('employees').select('id, role').eq('user_id', session.user.id).single(),
-    admin.from('employees').select('id, name, email, role').eq('id', employeeId).is('deleted_at', null).single(),
-  ])
-
-  const self   = selfResult.data
-  const target = targetResult.data
-
-  if (self?.role !== 'owner')  return { success: false, error: 'Недостаточно прав' }
-  if (!target)                 return { success: false, error: 'Сотрудник не найден' }
+  if (!target) return { success: false, error: 'Сотрудник не найден' }
   if (target.role === 'owner') return { success: false, error: 'Нельзя войти от имени владельца' }
 
-  // Пишем лог и ставим cookie параллельно
-  const { cookies } = await import('next/headers')
-  const [jar] = await Promise.all([
-    cookies(),
-    admin.from('audit_logs').insert({
-      employee_id:   self.id,
-      action:        'impersonation_start',
-      resource_type: 'employee',
-      resource_id:   employeeId,
-      new_data:      { target_name: target.name, target_email: target.email, target_role: target.role },
-    }),
-  ])
+  // Лог пишем ДО установки cookie и с await: раньше результат insert'а не
+  // проверялся, а CHECK на audit_logs.action отвергал 'impersonation_start',
+  // из-за чего записи молча терялись. Constraint расширен в
+  // db/002_auth_phase2.sql, теперь запись действительно сохраняется.
+  await query(
+    `INSERT INTO public.audit_logs
+       (employee_id, action, resource_type, resource_id, new_data)
+     VALUES ($1, 'impersonation_start', 'employee', $2, $3)`,
+    [
+      actor.realEmployeeId,
+      employeeId,
+      JSON.stringify({
+        target_name:  target.name,
+        target_email: target.email,
+        target_role:  target.role,
+      }),
+    ],
+  )
 
-  jar.set('impersonate_as', employeeId, {
+  const jar = await cookies()
+  jar.set(IMPERSONATION_COOKIE_NAME, employeeId, {
     path:     '/',
     sameSite: 'strict',
     httpOnly: true,
@@ -417,42 +483,31 @@ export async function startImpersonation(employeeId: string): Promise<ActionResu
 // ─── stopImpersonation ────────────────────────────────────────────────────────
 
 export async function stopImpersonation(): Promise<ActionResult> {
-  const supabase = await createClient()
-  const { cookies } = await import('next/headers')
+  const actor = await getActor()
+  if (!actor) return { success: false, error: 'Не авторизован' }
+  if (actor.realRole !== 'owner') return { success: false, error: 'Недостаточно прав' }
 
-  // Параллельно: сессия + cookie jar
-  const [{ data: { session } }, jar] = await Promise.all([
-    supabase.auth.getSession(),
-    cookies(),
-  ])
-  if (!session) return { success: false, error: 'Не авторизован' }
+  const jar = await cookies()
+  const employeeId = jar.get(IMPERSONATION_COOKIE_NAME)?.value
 
-  const admin      = createAdminClient()
-  const employeeId = jar.get('impersonate_as')?.value
+  if (employeeId && UUID_RE.test(employeeId)) {
+    const target = await queryOne<{ name: string; role: string }>(
+      'SELECT name, role FROM public.employees WHERE id = $1 LIMIT 1',
+      [employeeId],
+    )
 
-  // Параллельно: owner-роль + данные цели для лога
-  const [selfResult, targetResult] = await Promise.all([
-    supabase.from('employees').select('id, role').eq('user_id', session.user.id).single(),
-    employeeId && UUID_RE.test(employeeId)
-      ? admin.from('employees').select('name, role').eq('id', employeeId).maybeSingle()
-      : Promise.resolve({ data: null }),
-  ])
-
-  const self   = selfResult.data
-  const target = (targetResult as { data: { name: string; role: string } | null }).data
-
-  if (self?.role !== 'owner') return { success: false, error: 'Недостаточно прав' }
-
-  if (self && employeeId && UUID_RE.test(employeeId)) {
-    await admin.from('audit_logs').insert({
-      employee_id:   self.id,
-      action:        'impersonation_end',
-      resource_type: 'employee',
-      resource_id:   employeeId,
-      new_data:      target ? { target_name: target.name, target_role: target.role } : {},
-    })
+    await query(
+      `INSERT INTO public.audit_logs
+         (employee_id, action, resource_type, resource_id, new_data)
+       VALUES ($1, 'impersonation_end', 'employee', $2, $3)`,
+      [
+        actor.realEmployeeId,
+        employeeId,
+        JSON.stringify(target ? { target_name: target.name, target_role: target.role } : {}),
+      ],
+    )
   }
 
-  jar.delete('impersonate_as')
+  jar.delete(IMPERSONATION_COOKIE_NAME)
   return { success: true }
 }

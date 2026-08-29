@@ -6,11 +6,10 @@
 // паролю остаётся единственным способом попасть в систему.
 //
 // Реализовано именно как настоящий вход под заведённым владельцем, а не как
-// подставной пользователь: сессия настоящая, значит RLS, роли и права
-// работают ровно так же, как в бою, и локальная разработка не расходится
-// с продакшеном.
+// подставной пользователь: сессия настоящая, значит роли и права работают
+// ровно так же, как в бою, и локальная разработка не расходится с продакшеном.
 import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
+import { signIn } from '@/actions/auth'
 
 export async function GET(request: Request) {
   if (process.env.AUTH_BYPASS !== '1') {
@@ -26,16 +25,18 @@ export async function GET(request: Request) {
     )
   }
 
-  const supabase = await createClient()
-  const { error } = await supabase.auth.signInWithPassword({ email, password })
+  // Тот же signIn, что и у обычной формы входа: ставит cf_session, проходит
+  // через ту же проверку пароля и ту же брутфорс-защиту.
+  const result = await signIn(email, password)
 
-  if (error) {
+  if (!result.success) {
     return new NextResponse(
-      `Не удалось войти как ${email}: ${error.message}. ` +
+      `Не удалось войти как ${email}: ${result.error}. ` +
         'Проверьте, что пользователь заведён: npm run seed:owner',
       { status: 500 },
     )
   }
 
-  return NextResponse.redirect(new URL('/dashboard', request.url))
+  const next = result.mustChangePassword ? '/auth/change-password' : '/dashboard'
+  return NextResponse.redirect(new URL(next, request.url))
 }

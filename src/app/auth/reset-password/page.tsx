@@ -6,8 +6,9 @@ import { CheckCircle2, Eye, EyeOff, Lock } from 'lucide-react'
 import { confirmPasswordReset } from '@/actions/auth'
 import { PASSWORD_MIN_LENGTH, validatePassword, passwordStrength } from '@/lib/auth-validation'
 
-// Эта страница открывается ПОСЛЕ /auth/callback, который уже обменял code
-// на сессию server-side и поставил cookie. Здесь просто форма смены пароля.
+// Страница открывается по ссылке из письма: /auth/reset-password?token=...
+// Токен — единственное доказательство личности, сессии здесь нет и не должно
+// быть (раньше её ставил /auth/callback, обменивая recovery-код Supabase).
 
 export default function ResetPasswordPage() {
   const router = useRouter()
@@ -27,13 +28,19 @@ export default function ResetPasswordPage() {
     if (pwErr) { setError(pwErr); return }
     if (password !== confirm) { setError('Пароли не совпадают'); return }
 
+    // Токен читаем из адресной строки на месте, а не через useSearchParams:
+    // тот требует Suspense-границы вокруг страницы, а здесь значение нужно
+    // ровно один раз, в момент отправки.
+    const token = new URLSearchParams(window.location.search).get('token') ?? ''
+
     setLoading(true)
-    const result = await confirmPasswordReset(password)
+    const result = await confirmPasswordReset(token, password)
     setLoading(false)
 
     if (result.success) {
       setSuccess(true)
-      setTimeout(() => router.push('/dashboard'), 2000)
+      // Сброс пароля сессию не создаёт — отправляем на вход, а не в кабинет.
+      setTimeout(() => router.push('/auth/login'), 2000)
     } else {
       setError(result.error)
     }
@@ -64,7 +71,7 @@ export default function ResetPasswordPage() {
           </div>
           <h1 className="text-xl font-bold" style={{ color: '#1b1517' }}>Пароль обновлён</h1>
           <p className="text-sm" style={{ color: '#7d7174' }}>
-            Перенаправляем в личный кабинет...
+            Перенаправляем на страницу входа...
           </p>
         </div>
       </div>

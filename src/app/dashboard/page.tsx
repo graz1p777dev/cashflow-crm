@@ -1,6 +1,6 @@
 import { Suspense } from 'react'
 import { redirect } from 'next/navigation'
-import { createClient } from '@/lib/supabase/server'
+import { getActor } from '@/lib/auth/actor'
 import { getDayGreeting } from '@/lib/formatters'
 import LeftPanel from '@/components/dashboard/LeftPanel'
 import LeftPanelSkeleton from '@/components/dashboard/LeftPanelSkeleton'
@@ -12,52 +12,26 @@ import PageLoader from '@/components/common/PageLoader'
 export const metadata = { title: 'Дашборд — Cashflow' }
 
 export default async function DashboardPage() {
-  const supabase = await createClient()
+  // getActor() отдаёт роль, отдел и permission_level одним запросом,
+  // с учётом impersonation. Фолбэк для системных ролей — внутри него.
+  const actor = await getActor()
 
-  const { data: { session } } = await supabase.auth.getSession()
+  // TODO(миграция): LeftPanel/RightPanel всё ещё строят Supabase-клиент из
+  // accessToken. Их перевод на @/lib/db — отдельный шаг (вместе с остальными
+  // Realtime-компонентами); до тех пор токена взять неоткуда и панели данных
+  // не покажут. Проп сохранён, чтобы не менять их сигнатуры раньше времени.
+  const accessToken = ''
 
-  // access_token передаётся в LeftPanel/RightPanel как строка (serializable),
-  // чтобы они не вызывали cookies() внутри Suspense во время стриминга.
-  const accessToken = session?.access_token ?? null
+  const role            = actor?.role ?? 'mp'
+  const permissionLevel = actor?.permissionLevel ?? 'employee'
+  const employeeId      = actor?.employeeId ?? undefined
+  const departmentId    = actor?.departmentId ?? null
 
-  let role = 'mp'
-  let permissionLevel = 'employee'
-  let employeeId: string | undefined
-  let departmentId: string | null = null
-
-  if (session?.user) {
-    const [{ data: emp }, { data: permLevel }] = await Promise.all([
-      supabase
-        .from('employees')
-        .select('id, role, department_id')
-        .eq('user_id', session.user.id)
-        .single(),
-      // get_my_permission_level() — SECURITY DEFINER функция из migration 025
-      supabase.rpc('get_my_permission_level'),
-    ])
-
-    if (emp) {
-      role = emp.role as string
-      employeeId = emp.id as string
-      departmentId = emp.department_id as string | null
-    }
-    if (permLevel) {
-      permissionLevel = permLevel as string
-    } else {
-      // Фолбэк для системных ролей (если миграция ещё не применена)
-      const SYSTEM_LEVELS: Record<string, string> = {
-        owner: 'owner', rop: 'department_head',
-        mp: 'employee', lmai: 'employee', accountant: 'accountant',
-      }
-      permissionLevel = SYSTEM_LEVELS[role] ?? 'employee'
-    }
-  }
+  // Нет сессии — middleware должен поймать раньше, но на всякий случай
+  if (!actor) redirect('/auth/login')
 
   // Бухгалтер видит только финансы
   if (permissionLevel === 'accountant') redirect('/dashboard/finance')
-
-  // Нет сессии — middleware должен поймать раньше, но на всякий случай
-  if (!accessToken) redirect('/auth/login')
 
   const now = new Date()
   const year = now.getFullYear()

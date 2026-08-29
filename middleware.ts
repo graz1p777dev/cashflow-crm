@@ -1,31 +1,28 @@
-import { createServerClient } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
+import { decodeSession, SESSION_COOKIE_NAME } from '@/lib/auth/session'
 
-export async function middleware(request: NextRequest) {
+// Гейтинг маршрутов на подписанной cookie вместо supabase.auth.getUser().
+//
+// Раньше здесь были два похода наружу на каждый запрос: сетевой вызов GoTrue и
+// запрос роли в employees. Теперь — только проверка HMAC локально.
+//
+// Роль берётся из payload (снимок на момент входа), и это сознательный размен:
+// middleware остаётся без БД, но роль в нём может отстать от реальной, если
+// владелец сменил её у уже вошедшего сотрудника. Поэтому здесь только
+// удобные редиректы — доступ к данным закрывают проверки в Server Actions
+// через getActor(), где роль читается из БД (db/AUTH_DESIGN.md §2).
+//
+// decodeSession использует node:crypto — это допустимо: начиная с Next.js 16
+// middleware/proxy по умолчанию исполняется в Node.js-рантайме, а не в Edge
+// (конфиг runtime при этом задавать нельзя, он бросает ошибку).
+//
+// Файл остаётся middleware.ts: в Next.js 16 конвенция переименована в proxy.ts,
+// старое имя помечено deprecated, но продолжает работать. Переименование —
+// отдельный шаг (npx @next/codemod middleware-to-proxy .), не смешиваем его с
+// миграцией авторизации.
 
-  let supabaseResponse = NextResponse.next({ request })
-
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
-      cookies: {
-        getAll() {
-          return request.cookies.getAll()
-        },
-        setAll(cookiesToSet) {
-          cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value))
-          supabaseResponse = NextResponse.next({ request })
-          cookiesToSet.forEach(({ name, value, options }) =>
-            supabaseResponse.cookies.set(name, value, options)
-          )
-        },
-      },
-    }
-  )
-
-  // Проверяем токен через GoTrue, а не доверяем данным из cookie.
-  const { data: { user } } = await supabase.auth.getUser()
+export function middleware(request: NextRequest) {
+  const session = decodeSession(request.cookies.get(SESSION_COOKIE_NAME)?.value)
 
   const pathname      = request.nextUrl.pathname
   // /chat/[leadId] — история чата по ссылке из Telegram-карточки бота
@@ -35,38 +32,28 @@ export async function middleware(request: NextRequest) {
   const isAuthPage    = pathname.startsWith('/auth')
 
   // Без сессии — только публичные auth-страницы
-  if ((isDashboard || isInventory || isCashier) && !user) {
+  if ((isDashboard || isInventory || isCashier) && !session) {
     const url = request.nextUrl.clone()
     url.pathname = '/auth/login'
     return NextResponse.redirect(url)
   }
 
   // Кассир не получает доступ к CRM и товароучёту даже при прямом вводе URL.
-  // Роль берём из той же таблицы employees, которую используют RLS и Inventory.
-  if (user && (isDashboard || isInventory)) {
-    const { data: employee } = await supabase
-      .from('employees')
-      .select('role')
-      .eq('user_id', user.id)
-      .is('deleted_at', null)
-      .maybeSingle()
-
-    if (employee?.role === 'cashier') {
-      const url = request.nextUrl.clone()
-      url.pathname = '/cashier'
-      return NextResponse.redirect(url)
-    }
+  if (session && (isDashboard || isInventory) && session.role === 'cashier') {
+    const url = request.nextUrl.clone()
+    url.pathname = '/cashier'
+    return NextResponse.redirect(url)
   }
 
   // /auth/reset-password и /auth/change-password требуют активную сессию — не редиректим
   const isSessionRequired = pathname === '/auth/reset-password' || pathname === '/auth/change-password'
-  if (isAuthPage && !isSessionRequired && user) {
+  if (isAuthPage && !isSessionRequired && session) {
     const url = request.nextUrl.clone()
     url.pathname = '/dashboard'
     return NextResponse.redirect(url)
   }
 
-  return supabaseResponse
+  return NextResponse.next()
 }
 
 export const config = {

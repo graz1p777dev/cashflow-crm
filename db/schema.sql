@@ -118,6 +118,25 @@ CREATE TRIGGER set_users_updated_at
   BEFORE UPDATE ON public.users
   FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
 
+-- password_reset_tokens (added in 002_auth_phase2.sql) — GoTrue owned this flow
+-- internally, so Phase 1 had no equivalent. Single-use, expiring. Only the
+-- SHA-256 digest of the token is stored, never the token itself.
+CREATE TABLE public.password_reset_tokens (
+  id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id    UUID        NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  token_hash TEXT        NOT NULL UNIQUE,
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at    TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_password_reset_tokens_user_id
+  ON public.password_reset_tokens(user_id);
+
+CREATE INDEX idx_password_reset_tokens_expires_at
+  ON public.password_reset_tokens(expires_at)
+  WHERE used_at IS NULL;
+
 
 -- =============================================================================
 -- 2. roles + permissions (002, 020, 025)
@@ -970,8 +989,14 @@ CREATE TABLE public.audit_logs (
   user_agent    TEXT,
   created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
+  -- 'impersonation_start'/'impersonation_end' added in 002_auth_phase2.sql:
+  -- src/actions/auth.ts always wrote them, but the original constraint rejected
+  -- them, so those audit rows were being silently lost.
   CONSTRAINT audit_logs_action_check CHECK (
-    action IN ('create','update','delete','login','logout','export','view')
+    action IN (
+      'create','update','delete','login','logout','export','view',
+      'impersonation_start','impersonation_end'
+    )
   )
 );
 

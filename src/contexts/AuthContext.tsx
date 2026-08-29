@@ -1,6 +1,6 @@
 'use client'
-import { createContext, useContext, useEffect, useState, ReactNode } from 'react'
-import { createClient } from '@/lib/supabase/client'
+import { createContext, useContext, useState, ReactNode } from 'react'
+import { signOut as signOutAction } from '@/actions/auth'
 import { Employee } from '@/types'
 
 interface ImpersonationInfo {
@@ -41,26 +41,16 @@ export function AuthProvider({
   initialImpersonation,
 }: AuthProviderProps) {
   // Начальное состояние приходит с сервера — никаких клиентских запросов при инициализации.
-  // onAuthStateChange используется ТОЛЬКО для отслеживания SIGNED_OUT (logout).
+  //
+  // Подписки на onAuthStateChange больше нет: сессия живёт в httpOnly-cookie,
+  // клиент её не видит и события смены состояния получать неоткуда. Единственный
+  // выход из системы — signOut() ниже, он же и чистит локальное состояние.
   const [user, setUser]         = useState<Employee | null>(initialEmployee)
   const [realUser, setRealUser] = useState<Employee | null>(initialRealUser)
   const [impersonating, setImp] = useState<ImpersonationInfo | null>(initialImpersonation)
-  const supabase = createClient()
-
-  useEffect(() => {
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((event) => {
-      if (event === 'SIGNED_OUT') {
-        setUser(null)
-        setRealUser(null)
-        setImp(null)
-      }
-    })
-    return () => subscription.unsubscribe()
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
 
   const signOut = async () => {
-    await supabase.auth.signOut()
+    await signOutAction()
     setUser(null)
     setRealUser(null)
     setImp(null)
