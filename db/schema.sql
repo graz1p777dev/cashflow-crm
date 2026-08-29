@@ -6,6 +6,15 @@
 -- their FINAL state (renames of 026a applied, tables dropped in 025a / 029
 -- omitted). This file is meant to be applied ONCE to an empty database:
 --   psql "$DATABASE_URL" -f db/schema.sql
+--   psql "$DATABASE_URL" -f db/002_auth_phase2.sql
+--   psql "$DATABASE_URL" -f db/003_password_changed_at.sql
+--   psql "$DATABASE_URL" -f db/seed_permissions.sql
+--
+-- The 0NN_*.sql files are incremental and idempotent, so an already-provisioned
+-- instance is moved forward by running them in place — never by recreating the
+-- schema. seed_permissions.sql is DATA, not DDL (the role × resource matrix
+-- from 020_seed_permissions.sql); it is kept out of this file because the owner
+-- edits that matrix from the settings UI.
 --
 -- -----------------------------------------------------------------------------
 -- DECISION 1 — Row Level Security is NOT reproduced here.
