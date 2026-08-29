@@ -110,6 +110,12 @@ CREATE TABLE public.users (
   id            UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
   email         VARCHAR(255) NOT NULL UNIQUE,
   password_hash TEXT         NOT NULL,
+  -- 003: момент последней смены пароля. Токен сессии несёт iat; если iat
+  -- раньше этой отметки — токен выдан до смены пароля и считается отозванным
+  -- (см. getActor в src/lib/auth/actor.ts). Замена отсутствующему у stateless
+  -- cookie-сессии admin.auth.admin.signOut(token,'others') из Supabase.
+  -- NULL — пароль ни разу не менялся, все сессии действительны.
+  password_changed_at TIMESTAMPTZ,
   created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
   updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );

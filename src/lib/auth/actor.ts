@@ -81,6 +81,38 @@ const EMPLOYEE_SELECT = `
    WHERE e.deleted_at IS NULL
 `
 
+/**
+ * Запрос «свой» сотрудник + проверка, что токен выдан не раньше последней
+ * смены пароля.
+ *
+ * Подписанная cookie-сессия stateless: отозвать конкретный токен нечем, списка
+ * выданных токенов нет. Вместо него — одна отметка времени на пользователя
+ * (users.password_changed_at, db/003_password_changed_at.sql): сессия с iat
+ * раньше неё считается отозванной. Это и заменяет ушедший вместе с Supabase
+ * admin.auth.admin.signOut(token, 'others').
+ *
+ * Отдельного запроса проверка не стоит: users подшивается тем же JOIN, что уже
+ * идёт за ролью, а несоответствие iat просто не даёт строке вернуться.
+ *
+ * date_trunc обязателен: iat — целые секунды unix, password_changed_at —
+ * микросекунды. Без усечения сессия, выданная в ту же секунду, в которую
+ * сменили пароль, отвергалась бы, и войти сразу после смены было бы нельзя.
+ */
+const SELF_SELECT = `
+  ${EMPLOYEE_SELECT}
+     AND e.user_id = $1
+     AND EXISTS (
+       SELECT 1
+         FROM public.users u
+        WHERE u.id = e.user_id
+          AND (
+            u.password_changed_at IS NULL
+            OR date_trunc('second', u.password_changed_at) <= to_timestamp($2)
+          )
+     )
+   LIMIT 1
+`
+
 function levelOf(row: EmployeeRow): string {
   return row.permission_level ?? SYSTEM_PERMISSION_LEVELS[row.role] ?? 'employee'
 }
@@ -93,12 +125,11 @@ export async function getActor(): Promise<Actor | null> {
   const session = await getSession()
   if (!session) return null
 
-  const self = await queryOne<EmployeeRow>(
-    `${EMPLOYEE_SELECT} AND e.user_id = $1 LIMIT 1`,
-    [session.uid],
-  )
+  const self = await queryOne<EmployeeRow>(SELF_SELECT, [session.uid, session.iat])
 
-  // Сессия валидна, но сотрудника нет (архивирован/отвязан) — доступа нет.
+  // Строки нет по одной из двух причин, и обе означают «доступа нет»:
+  //   — сотрудника нет (архивирован/отвязан от аккаунта);
+  //   — токен выдан до последней смены пароля, то есть отозван.
   if (!self) return null
 
   const base: Actor = {

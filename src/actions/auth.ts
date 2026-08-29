@@ -210,8 +210,12 @@ export async function confirmPasswordReset(
   // Пароль и гашение токена — одной транзакцией: иначе при сбое между ними
   // ссылка осталась бы рабочей при уже сменённом пароле.
   await transaction(async (client) => {
+    // password_changed_at отзывает все ранее выданные сессии: их iat окажется
+    // раньше этой отметки, и getActor() перестанет их принимать. Ровно то, что
+    // делал admin.auth.admin.signOut(token, 'others') у Supabase. Здесь новую
+    // сессию не выдаём — сброс проходит без входа, пользователь логинится сам.
     await client.query(
-      'UPDATE public.users SET password_hash = $1 WHERE id = $2',
+      'UPDATE public.users SET password_hash = $1, password_changed_at = NOW() WHERE id = $2',
       [hash, row.user_id],
     )
     await client.query(
@@ -315,25 +319,36 @@ export async function changePasswordForce(newPassword: string): Promise<ActionRe
   const hash = await hashPassword(newPassword)
 
   let employeeName: string | null
+  let employeeId: string | null
+  let role: string
   try {
-    employeeName = await transaction(async (client) => {
+    const result = await transaction(async (client) => {
       await client.query(
-        'UPDATE public.users SET password_hash = $1 WHERE id = $2',
+        'UPDATE public.users SET password_hash = $1, password_changed_at = NOW() WHERE id = $2',
         [hash, session.uid],
       )
-      const emp = await client.query<{ name: string }>(
+      const emp = await client.query<{ id: string; name: string; role: string }>(
         `UPDATE public.employees
             SET must_change_password = false
           WHERE user_id = $1
-          RETURNING name`,
+          RETURNING id, name, role`,
         [session.uid],
       )
-      return emp.rows[0]?.name ?? null
+      return emp.rows[0] ?? null
     })
+    employeeName = result?.name ?? null
+    employeeId   = result?.id ?? null
+    role         = result?.role ?? session.role
   } catch (e) {
     console.error('[changePasswordForce]', e instanceof Error ? e.message : e)
     return { success: false, error: 'Не удалось обновить пароль. Попробуйте ещё раз.' }
   }
+
+  // password_changed_at только что отозвал ВСЕ сессии пользователя, включая
+  // текущую. Выдаём новую — с iat уже после смены пароля, поэтому чужие сессии
+  // остаются отозванными, а этот вход продолжается. Порядок важен: сессия
+  // выпускается после UPDATE, иначе её iat оказался бы раньше отметки.
+  await createSession({ uid: session.uid, eid: employeeId ?? session.eid, role })
 
   void notify({
     type: 'security',
@@ -400,13 +415,18 @@ export async function changeOwnPassword(newPassword: string): Promise<ActionResu
 
   try {
     await query(
-      'UPDATE public.users SET password_hash = $1 WHERE id = $2',
+      'UPDATE public.users SET password_hash = $1, password_changed_at = NOW() WHERE id = $2',
       [hash, session.uid],
     )
   } catch (e) {
     console.error('[changeOwnPassword]', e instanceof Error ? e.message : e)
     return { success: false, error: 'Не удалось обновить пароль. Попробуйте ещё раз.' }
   }
+
+  // Как и в changePasswordForce: смена пароля отзывает все сессии, поэтому
+  // текущую перевыпускаем — иначе пользователь вылетал бы из системы, меняя
+  // пароль у себя в профиле. Чужие сессии при этом остаются отозванными.
+  await createSession({ uid: session.uid, eid: session.eid, role: session.role })
 
   return { success: true }
 }

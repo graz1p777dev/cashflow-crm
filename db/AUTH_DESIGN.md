@@ -89,6 +89,23 @@ existence.
 | Admin creates user | `auth.admin.createUser` | insert `users` + `employees` in one tx |
 | Admin deletes user | `auth.admin.deleteUser` | delete `users` row (`employees.user_id` is `ON DELETE SET NULL`) |
 | Impersonation | `impersonate_as` cookie | unchanged pattern |
+| Revoke other sessions | `auth.admin.signOut(token, 'others')` | `users.password_changed_at` vs. token `iat` |
+
+**Session revocation (resolved in Phase 2.2).** A signed cookie is stateless:
+there is no token list to revoke from, so `signOut(token, 'others')` had no
+direct replacement and password changes briefly stopped invalidating other
+sessions. Fixed without a sessions table: `users.password_changed_at`
+(`db/003_password_changed_at.sql`) records the last change, and `getActor()`
+rejects any token whose `iat` predates it. Comparison is truncated to whole
+seconds because `iat` is integer unix seconds and the column is microsecond
+precision. `changeOwnPassword`/`changePasswordForce` re-issue the caller's own
+cookie immediately after the update, so only *other* sessions die — matching the
+old `'others'` semantics.
+
+Limitation to be aware of: `middleware.ts` verifies the cookie without touching
+the database, so a revoked token still passes routing. It is caught at the first
+`getActor()` call, i.e. before any data is read. Same trade-off as the stale
+`role` snapshot in §2.
 
 **Note:** password reset requires an email sender, which Supabase was providing
 for free. Pick one (Resend/Postmark/SMTP) in Phase 2 — this is an unbudgeted
