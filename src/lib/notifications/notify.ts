@@ -6,7 +6,7 @@
 // Никогда не бросает исключение наружу — уведомление не должно ронять
 // основной поток (смену пароля, ответ API статуса сервера и т.д.).
 
-import { createAdminClient } from '@/lib/supabase/admin'
+import { query } from '@/lib/db'
 
 export type NotificationType =
   | 'kpi_alert'
@@ -40,29 +40,36 @@ export interface NotifyInput {
 
 export async function notify(input: NotifyInput): Promise<void> {
   try {
-    const admin = createAdminClient()
-
     let employeeIds = input.employeeIds
     if (!employeeIds) {
-      const { data, error } = await admin.from('employees').select('id').eq('role', 'owner')
-      if (error) throw error
-      employeeIds = (data ?? []).map(e => e.id as string)
+      // Как и раньше: адресатов не задали — уходит всем владельцам.
+      // deleted_at не фильтруем намеренно, чтобы не менять поведение:
+      // старый запрос тоже брал всех с role = 'owner'.
+      const owners = await query<{ id: string }>(
+        `SELECT id FROM public.employees WHERE role = 'owner'`,
+      )
+      employeeIds = owners.map((e) => e.id)
     }
     if (employeeIds.length === 0) return
 
-    const { error } = await admin.from('notifications').insert(
-      employeeIds.map(employee_id => ({
-        employee_id,
-        type: input.type,
-        title: input.title,
-        body: input.body ?? null,
-        action_url: input.actionUrl ?? null,
-        is_important: input.isImportant ?? false,
-        source_type: input.sourceType ?? null,
-        source_id: input.sourceId ?? null,
-      }))
+    // Одна вставка на всех адресатов вместо N: unnest разворачивает массив
+    // employee_id в строки, остальные значения повторяются.
+    await query(
+      `INSERT INTO public.notifications
+         (employee_id, type, title, body, action_url, is_important, source_type, source_id)
+       SELECT employee_id, $2, $3, $4, $5, $6, $7, $8
+         FROM unnest($1::uuid[]) AS employee_id`,
+      [
+        employeeIds,
+        input.type,
+        input.title,
+        input.body ?? null,
+        input.actionUrl ?? null,
+        input.isImportant ?? false,
+        input.sourceType ?? null,
+        input.sourceId ?? null,
+      ],
     )
-    if (error) throw error
   } catch (err) {
     console.error('[notify] failed to insert notification:', err)
   }

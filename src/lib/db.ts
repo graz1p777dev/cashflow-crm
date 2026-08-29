@@ -1,4 +1,4 @@
-import { Pool, type PoolClient } from 'pg'
+import { Pool, types as pgTypes, type PoolClient } from 'pg'
 
 // Клиент Postgres поверх Railway. Заменяет Supabase-клиент как единственный
 // путь к данным.
@@ -18,6 +18,41 @@ declare global {
   // eslint-disable-next-line no-var
   var __cashflowPgPool: Pool | undefined
 }
+
+// ─── Разбор типов: приводим к тому, что отдавал PostgREST ────────────────────
+//
+// Supabase отдавал результат как JSON, поэтому весь код в src/types и в
+// компонентах написан под «numeric — это number, момент времени — ISO-строка».
+// Драйвер pg по умолчанию отдаёт другое: numeric и bigint строками (ради
+// точности, которая в JS-number не влезает), а даты — объектами Date.
+//
+// Без выравнивания это ломалось бы тихо и повсюду: `price.toFixed(2)` на
+// строке падает, `seats_total - taken` даёт "10-3" → NaN, а сравнение дат
+// строкой с Date молча всегда false. Поэтому разбор настраивается один раз
+// здесь, а не правится по месту в тридцати с лишним файлах src/actions.
+//
+// Про точность: numeric у нас — это деньги (суммы сделок, оклады, цены) и
+// коэффициенты KPI. Все они с большим запасом лежат в безопасном диапазоне
+// double, и ровно так же вели себя под Supabase — то есть это не потеря
+// точности, а сохранение текущего поведения. Если когда-нибудь появится
+// колонка, которой double мало, ей нужен свой разбор в месте использования.
+
+// numeric / decimal
+pgTypes.setTypeParser(pgTypes.builtins.NUMERIC, (v) => (v === null ? null : Number(v)))
+// bigint — telegram_chat_id и bot_messages.id
+pgTypes.setTypeParser(pgTypes.builtins.INT8, (v) => (v === null ? null : Number(v)))
+// date — отдаём как есть, 'YYYY-MM-DD': ровно то, что приходило от PostgREST
+// (hire_date, birth_date, due_date хранятся и сравниваются как строки).
+pgTypes.setTypeParser(pgTypes.builtins.DATE, (v) => v)
+// timestamptz — ISO-строка вместо Date.
+//
+// timestamp БЕЗ зоны намеренно не трогаем: в схеме таких колонок нет ни одной
+// (все моменты времени — timestamptz), а разбор наивного значения неизбежно
+// пришлось бы привязать к какой-то зоне и молча сдвинуть время. Появится такая
+// колонка — решать нужно будет вместе с ней, а не заранее и вслепую.
+pgTypes.setTypeParser(pgTypes.builtins.TIMESTAMPTZ, (v) =>
+  v === null ? null : new Date(v).toISOString(),
+)
 
 function createPool(): Pool {
   const connectionString = process.env.DATABASE_URL

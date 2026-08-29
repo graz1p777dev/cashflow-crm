@@ -1,13 +1,26 @@
 'use server'
 
-// Воронка продаж. Сделки живут в Supabase (036_deals.sql). Заводятся сами,
-// когда человек записывается на игру через Telegram-бота
-// (src/lib/deals/auto-create.ts), либо вручную из доски.
+// Воронка продаж (036_deals.sql). Сделки заводятся сами, когда человек
+// записывается на игру через Telegram-бота (src/lib/deals/auto-create.ts),
+// либо вручную из доски.
+//
+// ─── Про видимость сделок ────────────────────────────────────────────────────
+// Раньше «какие сделки видны» решала RLS-политика deals_select через
+// can_see_deal(). RLS вместе с Supabase ушла (db/schema.sql, DECISION 1), но
+// сам предикат Phase 1 сохранила как обычную SQL-функцию с явным параметром:
+//   can_see_deal(p_user_id UUID, d_responsible UUID)
+// Поэтому здесь он подставляется в WHERE — правило видимости остаётся ровно
+// тем же и продолжает жить в одном месте, а не переписывается на TypeScript.
+//
+// Тот же предикат стоит и в UPDATE: под RLS политика deals_update отсекала
+// чужие сделки, и запрос возвращал ноль строк — отсюда ответ «Сделка
+// недоступна» / «Недостаточно прав». Без него любой сотрудник мог бы
+// отредактировать чужую сделку по прямому id.
 
 import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
-import { createClient } from '@/lib/supabase/server'
-import { createAdminClient } from '@/lib/supabase/admin'
+import { query, queryOne } from '@/lib/db'
+import { getActor } from '@/lib/auth/actor'
 import type {
   Deal,
   DealEmployee,
@@ -23,20 +36,34 @@ export type DealActionResult<T = undefined> =
 
 // ─── Текущий сотрудник ───────────────────────────────────────────────────────
 
-async function getViewer(): Promise<DealViewer | null> {
-  const supabase = await createClient()
-  const { data: { session } } = await supabase.auth.getSession()
-  if (!session) return null
-
-  const { data } = await supabase
-    .from('employees')
-    .select('id, role, name')
-    .eq('user_id', session.user.id)
-    .is('deleted_at', null)
-    .maybeSingle()
-
-  return (data as DealViewer | null) ?? null
+interface Viewer extends DealViewer {
+  /** users.id — нужен как аргумент can_see_deal(). */
+  userId: string
 }
+
+/**
+ * Заменяет прежнюю пару getSession() + SELECT role FROM employees.
+ *
+ * Отличие в поведении, осознанное: getActor() учитывает impersonation, а
+ * прежний код смотрел только на user_id из сессии. То есть владелец, вошедший
+ * «от имени» менеджера, теперь видит доску глазами этого менеджера — ровно
+ * то, ради чего impersonation и существует.
+ */
+async function getViewer(): Promise<Viewer | null> {
+  const actor = await getActor()
+  if (!actor || !actor.employeeId) return null
+  return {
+    id: actor.employeeId,
+    role: actor.role as DealViewer['role'],
+    name: actor.name ?? '',
+    userId: actor.userId,
+  }
+}
+
+// can_see_deal() принимает users.id, а при impersonation действующее лицо —
+// другой сотрудник. Поэтому в предикат уходит user_id того, чьими глазами
+// смотрим, а не настоящего пользователя.
+const VIEWER_USER_ID = `(SELECT e.user_id FROM public.employees e WHERE e.id = $1)`
 
 // ─── Данные для доски ────────────────────────────────────────────────────────
 
@@ -51,34 +78,34 @@ export async function getDealsData(): Promise<DealsData> {
   const me = await getViewer()
   if (!me) return { stages: [], deals: [], employees: [], me: null }
 
-  const supabase = await createClient()
-  const admin = createAdminClient()
-
-  // deal_stages/deals — через RLS-клиент: какие сделки видны, решает БД.
-  // employees — через admin: имена нужны для пикера ответственного.
-  const [{ data: stages }, { data: deals }, { data: emps }] = await Promise.all([
-    supabase
-      .from('deal_stages')
-      .select('id, name, sort_order, kind, color, is_default, description')
-      .order('sort_order'),
-    supabase
-      .from('deals')
-      .select('*')
-      .is('deleted_at', null)
-      .order('created_at', { ascending: false }),
-    admin
-      .from('employees')
-      .select('id, name, avatar_url')
-      .is('deleted_at', null)
-      .order('name'),
+  // Три независимых запроса — параллельно, как и было.
+  const [stages, deals, employees] = await Promise.all([
+    // Этапы — справочник, их видели все вошедшие (deal_stages_select USING TRUE).
+    query<DealStage>(
+      `SELECT id, name, sort_order, kind, color, is_default, description
+         FROM public.deal_stages
+        ORDER BY sort_order`,
+    ),
+    query<Deal>(
+      `SELECT d.*
+         FROM public.deals d
+        WHERE d.deleted_at IS NULL
+          AND public.can_see_deal(${VIEWER_USER_ID}, d.responsible_employee_id)
+        ORDER BY d.created_at DESC`,
+      [me.id],
+    ),
+    // Имена всех сотрудников — для пикера ответственного. Под Supabase это
+    // шло через service-role клиент в обход RLS; отдельного клиента больше
+    // нет, ограничения — тоже, так что это просто запрос.
+    query<DealEmployee>(
+      `SELECT id, name, avatar_url
+         FROM public.employees
+        WHERE deleted_at IS NULL
+        ORDER BY name`,
+    ),
   ])
 
-  return {
-    stages: (stages ?? []) as DealStage[],
-    deals: (deals ?? []) as Deal[],
-    employees: (emps ?? []) as DealEmployee[],
-    me,
-  }
+  return { stages, deals, employees, me }
 }
 
 // ─── Форма сделки ────────────────────────────────────────────────────────────
@@ -110,33 +137,36 @@ export async function createDeal(input: DealFormData): Promise<DealActionResult<
     return { success: false, error: parsed.error.issues[0]?.message ?? 'Ошибка валидации' }
   }
   const d = parsed.data
-  const supabase = await createClient()
 
-  const { data: created, error } = await supabase
-    .from('deals')
-    .insert({
-      title: d.title,
-      stage_id: d.stage_id,
-      amount: d.amount ?? null,
-      currency: d.currency,
-      customer_name: clean(d.customer_name),
-      customer_phone: clean(d.customer_phone),
-      customer_username: clean(d.customer_username),
-      city: clean(d.city),
-      address: clean(d.address),
-      source: 'manual' satisfies DealSource,
-      responsible_employee_id: d.responsible_employee_id ?? null,
-      note: clean(d.note),
-    })
-    .select('id')
-    .single()
+  try {
+    const created = await queryOne<{ id: string }>(
+      `INSERT INTO public.deals
+         (title, stage_id, amount, currency, customer_name, customer_phone,
+          customer_username, city, address, source, responsible_employee_id, note)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       RETURNING id`,
+      [
+        d.title,
+        d.stage_id,
+        d.amount ?? null,
+        d.currency,
+        clean(d.customer_name),
+        clean(d.customer_phone),
+        clean(d.customer_username),
+        clean(d.city),
+        clean(d.address),
+        'manual' satisfies DealSource,
+        d.responsible_employee_id ?? null,
+        clean(d.note),
+      ],
+    )
+    if (!created) return { success: false, error: 'Не удалось создать сделку' }
 
-  if (error || !created) {
-    return { success: false, error: error?.message ?? 'Не удалось создать сделку' }
+    revalidatePath('/dashboard/deals')
+    return { success: true, data: { id: created.id } }
+  } catch (e) {
+    return { success: false, error: e instanceof Error ? e.message : 'Не удалось создать сделку' }
   }
-
-  revalidatePath('/dashboard/deals')
-  return { success: true, data: { id: (created as { id: string }).id } }
 }
 
 export async function updateDeal(id: string, input: DealFormData): Promise<DealActionResult> {
@@ -148,33 +178,50 @@ export async function updateDeal(id: string, input: DealFormData): Promise<DealA
     return { success: false, error: parsed.error.issues[0]?.message ?? 'Ошибка валидации' }
   }
   const d = parsed.data
-  const supabase = await createClient()
 
-  // status и stage_changed_at проставляет триггер БД — здесь их не трогаем.
-  const { data: updated, error } = await supabase
-    .from('deals')
-    .update({
-      title: d.title,
-      stage_id: d.stage_id,
-      amount: d.amount ?? null,
-      currency: d.currency,
-      customer_name: clean(d.customer_name),
-      customer_phone: clean(d.customer_phone),
-      customer_username: clean(d.customer_username),
-      city: clean(d.city),
-      address: clean(d.address),
-      responsible_employee_id: d.responsible_employee_id ?? null,
-      note: clean(d.note),
-    })
-    .eq('id', id)
-    .is('deleted_at', null)
-    .select('id')
+  try {
+    // status и stage_changed_at проставляет триггер БД — здесь их не трогаем.
+    const updated = await query<{ id: string }>(
+      `UPDATE public.deals AS t
+          SET title = $3,
+              stage_id = $4,
+              amount = $5,
+              currency = $6,
+              customer_name = $7,
+              customer_phone = $8,
+              customer_username = $9,
+              city = $10,
+              address = $11,
+              responsible_employee_id = $12,
+              note = $13
+        WHERE t.id = $2
+          AND t.deleted_at IS NULL
+          AND public.can_see_deal(${VIEWER_USER_ID}, t.responsible_employee_id)
+        RETURNING t.id`,
+      [
+        me.id,
+        id,
+        d.title,
+        d.stage_id,
+        d.amount ?? null,
+        d.currency,
+        clean(d.customer_name),
+        clean(d.customer_phone),
+        clean(d.customer_username),
+        clean(d.city),
+        clean(d.address),
+        d.responsible_employee_id ?? null,
+        clean(d.note),
+      ],
+    )
 
-  if (error) return { success: false, error: error.message }
-  if (!updated || updated.length === 0) return { success: false, error: 'Сделка недоступна' }
+    if (updated.length === 0) return { success: false, error: 'Сделка недоступна' }
 
-  revalidatePath('/dashboard/deals')
-  return { success: true }
+    revalidatePath('/dashboard/deals')
+    return { success: true }
+  } catch (e) {
+    return { success: false, error: e instanceof Error ? e.message : 'Не удалось сохранить сделку' }
+  }
 }
 
 /** Перенос карточки между колонками. deal_events пишет триггер БД. */
@@ -182,19 +229,23 @@ export async function moveDeal(dealId: string, stageId: string): Promise<DealAct
   const me = await getViewer()
   if (!me) return { success: false, error: 'Нет авторизации' }
 
-  const supabase = await createClient()
-  const { data, error } = await supabase
-    .from('deals')
-    .update({ stage_id: stageId })
-    .eq('id', dealId)
-    .is('deleted_at', null)
-    .select('id')
+  try {
+    const moved = await query<{ id: string }>(
+      `UPDATE public.deals AS t
+          SET stage_id = $3
+        WHERE t.id = $2
+          AND t.deleted_at IS NULL
+          AND public.can_see_deal(${VIEWER_USER_ID}, t.responsible_employee_id)
+        RETURNING t.id`,
+      [me.id, dealId, stageId],
+    )
+    if (moved.length === 0) return { success: false, error: 'Недостаточно прав' }
 
-  if (error) return { success: false, error: error.message }
-  if (!data || data.length === 0) return { success: false, error: 'Недостаточно прав' }
-
-  revalidatePath('/dashboard/deals')
-  return { success: true }
+    revalidatePath('/dashboard/deals')
+    return { success: true }
+  } catch (e) {
+    return { success: false, error: e instanceof Error ? e.message : 'Не удалось перенести сделку' }
+  }
 }
 
 /** Мягкое удаление — история переходов в deal_events остаётся. */
@@ -202,19 +253,23 @@ export async function deleteDeal(id: string): Promise<DealActionResult> {
   const me = await getViewer()
   if (!me) return { success: false, error: 'Нет авторизации' }
 
-  const supabase = await createClient()
-  const { data, error } = await supabase
-    .from('deals')
-    .update({ deleted_at: new Date().toISOString() })
-    .eq('id', id)
-    .is('deleted_at', null)
-    .select('id')
+  try {
+    const deleted = await query<{ id: string }>(
+      `UPDATE public.deals AS t
+          SET deleted_at = NOW()
+        WHERE t.id = $2
+          AND t.deleted_at IS NULL
+          AND public.can_see_deal(${VIEWER_USER_ID}, t.responsible_employee_id)
+        RETURNING t.id`,
+      [me.id, id],
+    )
+    if (deleted.length === 0) return { success: false, error: 'Сделка недоступна' }
 
-  if (error) return { success: false, error: error.message }
-  if (!data || data.length === 0) return { success: false, error: 'Сделка недоступна' }
-
-  revalidatePath('/dashboard/deals')
-  return { success: true }
+    revalidatePath('/dashboard/deals')
+    return { success: true }
+  } catch (e) {
+    return { success: false, error: e instanceof Error ? e.message : 'Не удалось удалить сделку' }
+  }
 }
 
 
@@ -234,13 +289,14 @@ export async function getDealConversation(dealId: string): Promise<DealConversat
   const me = await getViewer()
   if (!me) return { messages: [], note: 'Нет авторизации' }
 
-  const supabase = await createClient()
-  const { data } = await supabase
-    .from('deals')
-    .select('external_key')
-    .eq('id', dealId)
-    .maybeSingle()
-  const deal = data as { external_key: string | null } | null
+  const deal = await queryOne<{ external_key: string | null }>(
+    `SELECT d.external_key
+       FROM public.deals d
+      WHERE d.id = $2
+        AND public.can_see_deal(${VIEWER_USER_ID}, d.responsible_employee_id)
+      LIMIT 1`,
+    [me.id, dealId],
+  )
   if (!deal) return { messages: [], note: 'Сделка недоступна' }
 
   if (!deal.external_key?.startsWith('tg:')) {
@@ -248,21 +304,22 @@ export async function getDealConversation(dealId: string): Promise<DealConversat
   }
 
   const chatId = deal.external_key.slice('tg:'.length)
-  const { data: rows } = await supabase
-    .from('bot_messages')
-    .select('id, direction, sender, text, created_at')
-    .eq('chat_id', chatId)
-    .order('created_at')
-    .order('id')
-    .limit(200)
-
-  const messages: DealMessage[] = ((rows ?? []) as {
+  const rows = await query<{
     id: number
     direction: 'in' | 'out'
     sender: 'client' | 'bot' | 'operator'
     text: string
     created_at: string
-  }[]).map((row) => ({
+  }>(
+    `SELECT id, direction, sender, text, created_at
+       FROM public.bot_messages
+      WHERE chat_id = $1
+      ORDER BY created_at, id
+      LIMIT 200`,
+    [chatId],
+  )
+
+  const messages: DealMessage[] = rows.map((row) => ({
     id: String(row.id),
     direction: row.direction,
     sender: row.sender,

@@ -1,7 +1,7 @@
 'use server'
 
-import { createClient } from '@/lib/supabase/server'
-import { createAdminClient } from '@/lib/supabase/admin'
+import { query } from '@/lib/db'
+import { getActor } from '@/lib/auth/actor'
 import type { AuditAction, AuditRow } from '@/lib/audit-format'
 
 // audit_logs (миграция 015) — append-only лог изменений. Триггер
@@ -20,57 +20,79 @@ export async function recordAudit(input: {
   summary: string
 }): Promise<void> {
   try {
-    const supabase = await createClient()
-    const {
-      data: { user },
-    } = await supabase.auth.getUser()
-    if (!user) return
+    const actor = await getActor()
+    if (!actor) return
 
-    const admin = createAdminClient()
-    const { data: employee } = await admin
-      .from('employees')
-      .select('id')
-      .eq('user_id', user.id)
-      .maybeSingle()
-
-    await admin.from('audit_logs').insert({
-      employee_id: employee?.id ?? null,
-      action: input.action,
-      resource_type: input.resourceType,
-      resource_id: input.resourceId ?? null,
-      new_data: { summary: input.summary },
-    })
+    // Автором записи считается НАСТОЯЩИЙ пользователь, а не тот, от чьего
+    // имени работает владелец: смысл журнала в том, кто на самом деле нажал.
+    // Прежний код брал сотрудника по auth.getUser() и приходил к тому же —
+    // impersonation он попросту не видел.
+    await query(
+      `INSERT INTO public.audit_logs
+         (employee_id, action, resource_type, resource_id, new_data)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        actor.realEmployeeId,
+        input.action,
+        input.resourceType,
+        input.resourceId ?? null,
+        JSON.stringify({ summary: input.summary }),
+      ],
+    )
   } catch (e) {
     console.error('[recordAudit]', e)
   }
 }
 
 /**
- * Последние изменения для панели «Последние действия». RLS (audit_logs_select_owner)
- * отдаёт строки только владельцу — у остальных ролей список будет пустым.
+ * Последние изменения для панели «Последние действия».
+ *
+ * Раньше строки отбирала RLS-политика audit_logs_select_owner: журнал видел
+ * только владелец, у остальных ролей список приходил пустым. RLS вместе с
+ * Supabase ушла (db/schema.sql, DECISION 1), поэтому та же проверка сделана
+ * здесь явно — иначе журнал изменений открылся бы всем сотрудникам.
+ *
+ * Проверяется realRole: владелец в режиме impersonation журнал не теряет,
+ * а сотрудник не получает его через подделанную cookie.
  */
 export async function getAuditLog(limit = 15): Promise<AuditRow[]> {
-  const supabase = await createClient()
-  const { data, error } = await supabase
-    .from('audit_logs')
-    .select('id, action, resource_type, new_data, created_at, employees(name)')
-    .in('action', ['create', 'update', 'delete'])
-    .order('created_at', { ascending: false })
-    .limit(limit)
+  const actor = await getActor()
+  if (actor?.realRole !== 'owner') return []
 
-  if (error || !data) return []
+  try {
+    const rows = await query<{
+      id: string
+      action: AuditAction
+      resource_type: string
+      new_data: { summary?: string } | null
+      created_at: string
+      employee_name: string | null
+    }>(
+      `SELECT a.id,
+              a.action,
+              a.resource_type,
+              a.new_data,
+              a.created_at,
+              e.name AS employee_name
+         FROM public.audit_logs a
+         LEFT JOIN public.employees e ON e.id = a.employee_id
+        WHERE a.action IN ('create', 'update', 'delete')
+        ORDER BY a.created_at DESC
+        LIMIT $1`,
+      [limit],
+    )
 
-  return data.map((row) => {
-    const emp = row.employees as unknown as { name: string } | { name: string }[] | null
-    const employeeName = Array.isArray(emp) ? (emp[0]?.name ?? null) : (emp?.name ?? null)
-    const nd = row.new_data as { summary?: string } | null
-    return {
-      id: row.id as string,
-      action: row.action as AuditAction,
-      resourceType: row.resource_type as string,
-      summary: nd?.summary ?? '',
-      employeeName,
-      createdAt: row.created_at as string,
-    }
-  })
+    return rows.map((row) => ({
+      id: row.id,
+      action: row.action,
+      resourceType: row.resource_type,
+      summary: row.new_data?.summary ?? '',
+      employeeName: row.employee_name,
+      createdAt: row.created_at,
+    }))
+  } catch (e) {
+    // Прежняя версия на ошибке молча отдавала пустой список — сохраняем.
+    console.error('[getAuditLog]', e)
+    return []
+  }
 }

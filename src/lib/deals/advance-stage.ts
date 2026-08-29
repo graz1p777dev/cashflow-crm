@@ -9,7 +9,7 @@
 // supabase/migrations/036_deals.sql) — здесь их не трогаем. Сумму и состав
 // брони сделке не проставляем: это отдельная таблица game_bookings.
 
-import { createAdminClient } from '@/lib/supabase/admin'
+import { query, queryOne } from '@/lib/db'
 
 /** action → название этапа (supabase/migrations/036_deals.sql). */
 const ACTION_STAGE_NAME: Record<string, string> = {
@@ -43,53 +43,46 @@ export async function advanceDealFromBotAction(
   const key = externalKey.trim()
   if (!key) return { ok: false, error: 'externalKey пустой' }
 
-  const supabase = createAdminClient()
+  try {
+    const deal = await queryOne<{ id: string; stage_id: string; status: string }>(
+      `SELECT id, stage_id, status
+         FROM public.deals
+        WHERE external_key = $1
+          AND deleted_at IS NULL
+        LIMIT 1`,
+      [key],
+    )
+    if (!deal) return { ok: false, skipped: 'not_found' }
 
-  const { data: deal, error: dealError } = await supabase
-    .from('deals')
-    .select('id, stage_id, status')
-    .eq('external_key', key)
-    .is('deleted_at', null)
-    .maybeSingle()
-  if (dealError) return { ok: false, error: dealError.message }
-  if (!deal) return { ok: false, skipped: 'not_found' }
-  const d = deal as { id: string; stage_id: string; status: string }
+    // Сделку, которую менеджер уже закрыл (выиграна/потеряна), бот не трогает.
+    if (deal.status !== 'open') return { ok: true, skipped: 'terminal' }
 
-  // Сделку, которую менеджер уже закрыл (выиграна/потеряна), бот не трогает.
-  if (d.status !== 'open') return { ok: true, skipped: 'terminal' }
+    const currentStage = await queryOne<{ sort_order: number }>(
+      'SELECT sort_order FROM public.deal_stages WHERE id = $1 LIMIT 1',
+      [deal.stage_id],
+    )
 
-  const { data: currentStage, error: currentStageError } = await supabase
-    .from('deal_stages')
-    .select('sort_order')
-    .eq('id', d.stage_id)
-    .maybeSingle()
-  if (currentStageError) return { ok: false, error: currentStageError.message }
+    const target = await queryOne<{ id: string; sort_order: number }>(
+      'SELECT id, sort_order FROM public.deal_stages WHERE name = $1 LIMIT 1',
+      [targetStageName],
+    )
+    if (!target) return { ok: false, error: `Этап "${targetStageName}" не найден` }
 
-  const { data: targetStage, error: targetStageError } = await supabase
-    .from('deal_stages')
-    .select('id, sort_order')
-    .eq('name', targetStageName)
-    .maybeSingle()
-  if (targetStageError) return { ok: false, error: targetStageError.message }
-  if (!targetStage) return { ok: false, error: `Этап "${targetStageName}" не найден` }
-  const target = targetStage as { id: string; sort_order: number }
+    // Воронка двигается только вперёд — повторное распознанное намерение
+    // (например клиент второй раз спросил про товар) не откатывает сделку.
+    // Исключение — no_show (см. BYPASS_FORWARD_ONLY выше).
+    if (
+      !BYPASS_FORWARD_ONLY.has(action) &&
+      currentStage &&
+      target.sort_order <= currentStage.sort_order
+    ) {
+      return { ok: true, id: deal.id, skipped: 'no_change' }
+    }
 
-  // Воронка двигается только вперёд — повторное распознанное намерение
-  // (например клиент второй раз спросил про товар) не откатывает сделку.
-  // Исключение — non_standard_request (см. BYPASS_FORWARD_ONLY выше).
-  if (
-    !BYPASS_FORWARD_ONLY.has(action) &&
-    currentStage &&
-    target.sort_order <= (currentStage as { sort_order: number }).sort_order
-  ) {
-    return { ok: true, id: d.id, skipped: 'no_change' }
+    await query('UPDATE public.deals SET stage_id = $1 WHERE id = $2', [target.id, deal.id])
+
+    return { ok: true, id: deal.id }
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) }
   }
-
-  const { error: updateError } = await supabase
-    .from('deals')
-    .update({ stage_id: target.id })
-    .eq('id', d.id)
-  if (updateError) return { ok: false, error: updateError.message }
-
-  return { ok: true, id: d.id }
 }
