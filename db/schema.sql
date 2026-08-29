@@ -54,20 +54,30 @@
 --     let functions bypass RLS; with no RLS it only adds risk.
 --
 -- -----------------------------------------------------------------------------
--- KNOWN GAPS — verify against production before the data load
+-- VERIFIED against the live Supabase project (2026-08-29)
 -- -----------------------------------------------------------------------------
---   * Migration numbers 034, 037, 038, 040, 041 do not exist in the repo. Git
---     history is squashed (3 commits, no per-migration history), so whether
---     they were renamed or never committed cannot be determined from here.
---     Nothing in 035..042 references anything they would have created, so this
---     file assumes they never reached production. CONFIRM by diffing this
---     schema against the live Supabase catalog before migrating data.
---   * public.marketing_daily_data is queried by the app
+-- Introspected via the PostgREST OpenAPI document of the one and only Supabase
+-- project backing this app (ref tmbynmssxviiowtxtxtg), captured verbatim in
+-- db/live-schema-openapi.json. Result:
+--
+--   * The live public schema exposes exactly 41 tables. All 41 appear in this
+--     file with identical column NAMES, TYPES, NULLABILITY and DEFAULTS. There
+--     is no schema drift. (public.users below is a Phase 1 addition replacing
+--     Supabase's auth.users — by design, not drift.)
+--   * Migration numbers 034, 037, 038, 040, 041: RESOLVED. The live catalog
+--     contains no table, column or default that the committed migrations do not
+--     account for, so those numbers never produced public-schema DDL — they
+--     were skipped, or were local/aborted work. deal_stages.description (039)
+--     and deals.city/deals.address (20260810154527) are both present, which
+--     brackets the gap on both sides.
+--   * public.marketing_daily_data DOES NOT EXIST in the live database
+--     (PostgREST 404). The app queries it anyway
 --     (src/lib/data/adapters/marketing/SupabaseMarketingAdapter.ts,
---     src/app/dashboard/calendar/page.tsx) but is created by NO migration —
---     it was made by hand in the cloud project. Its definition below is
---     RECONSTRUCTED from the columns the app selects. Types and constraints
---     are a guess: dump the real DDL from Supabase and replace it.
+--     src/app/dashboard/calendar/page.tsx). Phase 1 invented a definition from
+--     the selected columns; that invention has been REMOVED — see §22.
+--   * Note: PostgREST's OpenAPI output omits defaults for jsonb columns, so
+--     kpi_templates.metrics DEFAULT '{}' and settings.extra DEFAULT '{}' were
+--     confirmed from migrations 006/014 rather than from the live catalog.
 --   * middleware.ts gates /inventory and /cashier and knows a 'cashier' role,
 --     but no such routes or tables exist in this repo and no migration adds
 --     them. Treated as dead/forward-looking; nothing added for them.
@@ -1491,26 +1501,16 @@ CREATE INDEX idx_bot_messages_chat ON public.bot_messages(chat_id, created_at);
 
 
 -- =============================================================================
--- 22. marketing_daily_data — RECONSTRUCTED, NOT from any migration.
---     See KNOWN GAPS in the header. Replace with the real DDL dumped from
---     Supabase before loading data.
+-- 22. marketing_daily_data — DELIBERATELY ABSENT.
+--     Phase 1 reconstructed this table by guessing from the columns the app
+--     selects. Phase 2 introspected the live Supabase project (see
+--     db/live-schema-openapi.json): the table DOES NOT EXIST there. Every app
+--     query against it (SupabaseMarketingAdapter.ts, calendar/page.tsx) is
+--     already failing in production and being swallowed. Creating it here
+--     would invent a table the system has never had, so it is not created.
+--     Phase 2 app work must either delete the marketing adapter or add the
+--     table as a deliberate new feature — not as a migration artefact.
 -- =============================================================================
-
-CREATE TABLE public.marketing_daily_data (
-  id               UUID          PRIMARY KEY DEFAULT gen_random_uuid(),
-  date             DATE          NOT NULL UNIQUE,
-  active_campaigns INTEGER,
-  reach            INTEGER,
-  clicks           INTEGER,
-  budget           NUMERIC(12,2),
-  ad_appeals       INTEGER,
-  created_at       TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
-  updated_at       TIMESTAMPTZ   NOT NULL DEFAULT NOW()
-);
-
-CREATE TRIGGER set_marketing_daily_data_updated_at
-  BEFORE UPDATE ON public.marketing_daily_data
-  FOR EACH ROW EXECUTE FUNCTION public.set_updated_at();
 
 
 -- =============================================================================

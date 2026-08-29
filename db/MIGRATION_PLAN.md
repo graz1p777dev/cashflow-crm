@@ -9,46 +9,65 @@ environment-variable change in the app, and so is the rollback.
 
 ---
 
-## 0. Preconditions — verify before you run anything
+## 0. Preconditions — **VERIFIED 2026-08-29** (3 of 4 closed)
 
-These are open questions, not assumptions. Answer each one against the live
-database before the first `pg_dump`.
+Checked read-only against the live Supabase project (ref `tmbynmssxviiowtxtxtg`)
+via PostgREST with the service-role key. No writes were made. Evidence:
+`db/live-schema-openapi.json` (raw) and `db/live-data-summary.md` (counts).
 
-1. **Does the repo's migration set match production?**
-   Migration numbers 034, 037, 038, 040, 041 are absent from
-   `supabase/migrations/`, and git history is squashed so their fate is
-   unrecoverable from the repo. Additionally, `026a_rename_core_tables.sql` and
-   `025a_drop_consultation_results.sql` document changes that were made *by hand*
-   in the cloud project — i.e. the repo is known to lag reality at least once.
+There is no separate production project — this is the only Supabase project for
+this app, so "does the repo match production" and "does the repo match dev" are
+the same question.
 
-   Verification (read-only, safe):
+1. ~~**Does the repo's migration set match production?**~~ — **CLOSED. It does.**
+   The live `public` schema exposes exactly 41 tables. All 41 exist in
+   `db/schema.sql` with identical column names, types, nullability and defaults.
+   Zero drift.
 
-   ```bash
-   pg_dump "$SUPABASE_URL" --schema-only --schema=public --no-owner --no-acl \
-     > /tmp/supabase_actual.sql
-   ```
+   The 034 / 037 / 038 / 040 / 041 mystery is **resolved**: the live catalog
+   contains nothing the committed migrations do not account for, so those
+   numbers never produced public-schema DDL. `deal_stages.description` (from
+   039) and `deals.city` / `deals.address` (from `20260810154527`) are both
+   present, bracketing the gap on both sides. The hand-made changes recorded in
+   `025a` and `026a` are likewise reflected — the repo's compensating migrations
+   captured them correctly.
 
-   Diff `/tmp/supabase_actual.sql` against `db/schema.sql` table by table.
-   Every difference is either (a) an RLS/Supabase artefact we intentionally
-   dropped, or (b) a table/column we are about to lose. Resolve every (b) before
-   proceeding.
+   Caveat on method: PostgREST's OpenAPI document does not report defaults for
+   `jsonb` columns, so `kpi_templates.metrics DEFAULT '{}'` and
+   `settings.extra DEFAULT '{}'` were confirmed from migrations 006/014 instead.
+   It also cannot see indexes, CHECK constraints, functions or triggers — those
+   remain derived from the migration files, which the table/column agreement
+   gives good reason to trust.
 
-2. **`public.marketing_daily_data` DDL.** The app reads it; no migration creates
-   it. The definition in `db/schema.sql` is reverse-engineered from the columns
-   the app selects. Replace it with the real DDL from step 1.
+2. ~~**`public.marketing_daily_data` DDL.**~~ — **CLOSED. The table does not
+   exist.** PostgREST returns 404, and it is absent from the OpenAPI document.
+   Phase 1's reconstructed definition has been **deleted** from `db/schema.sql`.
+   The app's two call sites
+   (`src/lib/data/adapters/marketing/SupabaseMarketingAdapter.ts`,
+   `src/app/dashboard/calendar/page.tsx`) are querying a table that has never
+   existed and are failing silently today. Phase 2 decides: delete the marketing
+   adapter, or introduce the table as a new feature. Either way it is **not** a
+   migration concern — nothing to carry over.
 
-3. **`auth.users.encrypted_password` format.** See §3 — this is the single
-   riskiest unknown and it must be settled by inspection, not by assumption.
+3. **`auth.users.encrypted_password` format.** — **STILL OPEN.** The `auth`
+   schema is not exposed over PostgREST, so this cannot be settled without a
+   direct Postgres connection. See §3. Mitigating fact: there are only **4
+   employees**, which makes Path B (forced password reset) obviously correct and
+   drains most of the risk out of leaving this open.
 
-4. **Row counts per table**, captured before and compared after:
+4. ~~**Row counts per table.**~~ — **CLOSED.** Exact counts captured in
+   `db/live-data-summary.md`. Headline: **273 rows across 41 tables**, of which
+   roughly 100 are reference seeds. 4 employees, 13 deals, 12 games, 12 game
+   bookings, 61 bot messages, 43 notifications, 5 tasks. The entire
+   HR/KPI/finance side — consultations, salaries, attendance, finance
+   transactions, documents, all KPI result tables — is **empty**.
 
-   ```sql
-   SELECT relname, n_live_tup FROM pg_stat_user_tables
-   WHERE schemaname = 'public' ORDER BY relname;
-   ```
+   Read `db/live-data-summary.md` before executing §4: at this volume most of
+   the load machinery is precaution rather than necessity, but the seed-UUID
+   collision described in §2 becomes the migration's main hazard.
 
-   `n_live_tup` is an estimate; for the final verification use exact
-   `SELECT count(*)` per table on both sides.
+   For the final before/after comparison still use exact `SELECT count(*)` per
+   table on both sides.
 
 ---
 
@@ -197,7 +216,6 @@ FK-safe order. Load each table fully before starting the next.
 | 28 | `deal_stages` → `deals` → `deal_events` | cascade in order |
 | 29 | `games` → `game_bookings` | games, deals |
 | 30 | `bot_messages` | — |
-| 31 | `marketing_daily_data` | — |
 
 Two self- and forward-referencing FKs need the two-pass treatment marked above:
 `departments.manager_id → employees.id` and
@@ -235,7 +253,7 @@ for t in users roles departments employees permissions work_schedules \
          kpi_bonus_blocks kpi_bonus_tiers employee_kpi_results \
          employee_kpi_item_results advance_payments company_plans \
          tasks task_members deal_stages deals deal_events \
-         games game_bookings bot_messages marketing_daily_data; do
+         games game_bookings bot_messages; do
   pg_dump "$SUPABASE_URL" --data-only --no-owner --no-acl \
     --table="public.$t" > "dump/${t}.sql"
 done
