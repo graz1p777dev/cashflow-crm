@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useMemo, useState, useTransition } from 'react'
 import { Plus, Users, MapPin, Eye, EyeOff, Clock } from 'lucide-react'
 import { toast } from 'sonner'
-import { createClient } from '@/lib/supabase/client'
 import { cn } from '@/lib/utils'
 import { formatMoney } from '@/lib/formatters'
 import { getGamesData, setGamePublished, type GameHost } from '@/actions/games'
@@ -38,24 +37,12 @@ export default function GamesClient({ initialGames, initialBookings, hosts, role
     setBookings(data.bookings)
   }, [])
 
-  // Записи приходят из бота, а не из этого браузера — без realtime список
-  // молча устаревал бы, пока менеджер смотрит на карточку игры.
+  // Записи приходят из бота, а не из этого браузера — без обновления список
+  // молча устаревал бы, пока менеджер смотрит на карточку игры. Раньше это
+  // была Supabase Realtime-подписка; на Postgres без Realtime — поллинг.
   useEffect(() => {
-    const supabase = createClient()
-    let timer: ReturnType<typeof setTimeout> | null = null
-    const bump = () => {
-      if (timer) clearTimeout(timer)
-      timer = setTimeout(refresh, 400)
-    }
-    const channel = supabase
-      .channel('games-board')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'game_bookings' }, bump)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'games' }, bump)
-      .subscribe()
-    return () => {
-      if (timer) clearTimeout(timer)
-      supabase.removeChannel(channel)
-    }
+    const interval = setInterval(refresh, 5000)
+    return () => clearInterval(interval)
   }, [refresh])
 
   const now = Date.now()

@@ -25,6 +25,7 @@ export type NotificationType =
   | 'security'
   | 'audit'
   | 'game_booking'
+  | 'bot_message'
 
 export interface NotifyInput {
   type: NotificationType

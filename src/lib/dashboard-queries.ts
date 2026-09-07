@@ -1,4 +1,4 @@
-import type { SupabaseClient } from '@supabase/supabase-js'
+import { query, queryOne } from '@/lib/db'
 import type {
   PlanVsFactRow,
   DashboardMonthStats,
@@ -24,7 +24,6 @@ export interface WeekRevenuePoint {
 // ─────────────────────────────────────────────
 
 export async function getMonthKpiStats(
-  supabase: SupabaseClient,
   year: number,
   month: number,
   employeeId?: string
@@ -35,49 +34,53 @@ export async function getMonthKpiStats(
   const endDateStr = `${year}-${String(month).padStart(2, '0')}-${String(endDate.getDate()).padStart(2, '0')}`
 
   // Факт: данные из sales_plan_weekly (агрегированы триггером)
-  let decompositionQuery = supabase
-    .from('sales_plan_weekly')
-    .select('total_fv_fact, total_sales_fact, total_revenue_fact, kpi_pct, total_fv_plan, total_sales_plan, total_revenue_plan')
-    .eq('period_year', year)
-    .eq('period_month', month)
-
-  if (employeeId) {
-    decompositionQuery = decompositionQuery.eq('employee_id', employeeId)
-  }
-
-  const { data: decompositionRows } = await decompositionQuery
+  const decompositionRows = await query<{
+    total_fv_fact: number | null
+    total_sales_fact: number | null
+    total_revenue_fact: number | null
+    kpi_pct: number | null
+    total_fv_plan: number | null
+    total_sales_plan: number | null
+    total_revenue_plan: number | null
+  }>(
+    `SELECT total_fv_fact, total_sales_fact, total_revenue_fact, kpi_pct, total_fv_plan, total_sales_plan, total_revenue_plan
+       FROM public.sales_plan_weekly
+      WHERE period_year = $1 AND period_month = $2
+        AND ($3::uuid IS NULL OR employee_id = $3)`,
+    [year, month, employeeId ?? null],
+  )
 
   console.log(`[kpi] decompositionQuery: ${Date.now() - t0}ms`)
   if (!decompositionRows || decompositionRows.length === 0) {
     // Если нет строк декомпозиции — считаем из консультаций напрямую
-    let consultQuery = supabase
-      .from('consultations')
-      .select('status_after_fv, amount, is_nv')
-      .gte('date', startDate)
-      .lte('date', endDateStr)
-      .is('deleted_at', null)
-
-    if (employeeId) {
-      consultQuery = consultQuery.eq('manager_id', employeeId)
-    }
-
-    const { data: consults } = await consultQuery
+    const consults = await query<{
+      status_after_fv: string | null
+      amount: number | null
+      is_nv: boolean | null
+    }>(
+      `SELECT status_after_fv, amount, is_nv
+         FROM public.consultations
+        WHERE date >= $1 AND date <= $2
+          AND deleted_at IS NULL
+          AND ($3::uuid IS NULL OR manager_id = $3)`,
+      [startDate, endDateStr, employeeId ?? null],
+    )
     console.log(`[kpi] fallback consultQuery: ${Date.now() - t0}ms`)
 
-    const fv = consults?.filter(c =>
+    const fv = consults.filter(c =>
       c.status_after_fv !== null && c.status_after_fv !== undefined
-    ).length ?? 0
+    ).length
 
-    const sales = consults?.filter(c =>
+    const sales = consults.filter(c =>
       c.status_after_fv === 'Купила' || c.status_after_fv === 'Предоплата'
-    ).length ?? 0
+    ).length
 
-    const revenue = consults?.reduce((sum, c) => {
+    const revenue = consults.reduce((sum, c) => {
       if (c.status_after_fv === 'Купила' || c.status_after_fv === 'Предоплата') {
         return sum + (Number(c.amount) || 0)
       }
       return sum
-    }, 0) ?? 0
+    }, 0)
 
     return { fv, sales, revenue, kpi_pct: 0, plan_fv: 0, plan_sales: 0, plan_revenue: 0 }
   }
@@ -116,7 +119,6 @@ export async function getMonthKpiStats(
 // ─────────────────────────────────────────────
 
 export async function getRevenueByWeeks(
-  supabase: SupabaseClient,
   year: number,
   month: number,
   employeeId?: string
@@ -126,29 +128,24 @@ export async function getRevenueByWeeks(
   const startDate = `${year}-${String(month).padStart(2, '0')}-01`
   const endDate = `${year}-${String(month).padStart(2, '0')}-${String(daysInMonth).padStart(2, '0')}`
 
-  let consultationsQuery = supabase
-    .from('consultations')
-    .select('date, amount, status_after_fv')
-    .gte('date', startDate)
-    .lte('date', endDate)
-    .in('status_after_fv', ['Купила', 'Предоплата'])
-    .is('deleted_at', null)
-
-  if (employeeId) {
-    consultationsQuery = consultationsQuery.eq('manager_id', employeeId)
-  }
-
-  let activityQuery = supabase
-    .from('daily_activity')
-    .select('date, revenue_fact')
-    .gte('date', startDate)
-    .lte('date', endDate)
-
-  if (employeeId) {
-    activityQuery = activityQuery.eq('employee_id', employeeId)
-  }
-
-  const [{ data: consults }, { data: activity }] = await Promise.all([consultationsQuery, activityQuery])
+  const [consults, activity] = await Promise.all([
+    query<{ date: string; amount: number | null; status_after_fv: string | null }>(
+      `SELECT date, amount, status_after_fv
+         FROM public.consultations
+        WHERE date >= $1 AND date <= $2
+          AND status_after_fv IN ('Купила', 'Предоплата')
+          AND deleted_at IS NULL
+          AND ($3::uuid IS NULL OR manager_id = $3)`,
+      [startDate, endDate, employeeId ?? null],
+    ),
+    query<{ date: string; revenue_fact: number | null }>(
+      `SELECT date, revenue_fact
+         FROM public.daily_activity
+        WHERE date >= $1 AND date <= $2
+          AND ($3::uuid IS NULL OR employee_id = $3)`,
+      [startDate, endDate, employeeId ?? null],
+    ),
+  ])
   console.log(`[revenueByWeeks] ${Date.now() - t0}ms`)
 
   // Группируем по неделям (1–7, 8–14, 15–21, 22–end)
@@ -160,11 +157,11 @@ export async function getRevenueByWeeks(
   ]
 
   const revenueByDay = new Map<string, number>()
-  for (const consultation of consults ?? []) {
-    revenueByDay.set(consultation.date as string, (revenueByDay.get(consultation.date as string) ?? 0) + (Number(consultation.amount) || 0))
+  for (const consultation of consults) {
+    revenueByDay.set(consultation.date, (revenueByDay.get(consultation.date) ?? 0) + (Number(consultation.amount) || 0))
   }
-  for (const row of activity ?? []) {
-    if (row.revenue_fact !== null) revenueByDay.set(row.date as string, Number(row.revenue_fact) || 0)
+  for (const row of activity) {
+    if (row.revenue_fact !== null) revenueByDay.set(row.date, Number(row.revenue_fact) || 0)
   }
 
   for (const [date, revenue] of revenueByDay) {
@@ -183,37 +180,40 @@ export async function getRevenueByWeeks(
 // ─────────────────────────────────────────────
 
 export async function getPlanVsFactTable(
-  supabase: SupabaseClient,
   year: number,
   month: number,
   employeeId?: string
 ): Promise<PlanVsFactRow[]> {
   const t0 = Date.now()
-  let query = supabase
-    .from('sales_plan_weekly')
-    .select(`
-      employee_id,
-      total_fv_plan, total_fv_fact,
-      total_sales_plan, total_sales_fact,
-      total_revenue_fact,
-      kpi_pct,
-      employees!inner(name)
-    `)
-    .eq('period_year', year)
-    .eq('period_month', month)
-
-  if (employeeId) {
-    query = query.eq('employee_id', employeeId)
-  }
-
-  const { data: rows } = await query
+  const rows = await query<{
+    employee_id: string
+    employee_name: string
+    total_fv_plan: number | null
+    total_fv_fact: number | null
+    total_sales_plan: number | null
+    total_sales_fact: number | null
+    total_revenue_fact: number | null
+    kpi_pct: number | null
+  }>(
+    `SELECT spw.employee_id,
+            e.name AS employee_name,
+            spw.total_fv_plan, spw.total_fv_fact,
+            spw.total_sales_plan, spw.total_sales_fact,
+            spw.total_revenue_fact,
+            spw.kpi_pct
+       FROM public.sales_plan_weekly spw
+       JOIN public.employees e ON e.id = spw.employee_id
+      WHERE spw.period_year = $1 AND spw.period_month = $2
+        AND ($3::uuid IS NULL OR spw.employee_id = $3)`,
+    [year, month, employeeId ?? null],
+  )
   console.log(`[planVsFact] ${Date.now() - t0}ms`)
 
   if (!rows || rows.length === 0) return []
 
   return rows.map((row) => ({
-    employee_id: row.employee_id as string,
-    employee_name: (row.employees as unknown as { name: string }).name,
+    employee_id: row.employee_id,
+    employee_name: row.employee_name,
     plan_fv: Number(row.total_fv_plan) || 0,
     fact_fv: Number(row.total_fv_fact) || 0,
     plan_sales: Number(row.total_sales_plan) || 0,
@@ -228,52 +228,48 @@ export async function getPlanVsFactTable(
 // ─────────────────────────────────────────────
 
 export async function getTodayStats(
-  supabase: SupabaseClient,
   dateStr: string,
   employeeId?: string
 ): Promise<DashboardTodayStats> {
   const t0 = Date.now()
-  let consultationsQuery = supabase
-    .from('consultations')
-    .select('status_after_fv, actual_status, amount')
-    .eq('date', dateStr)
-    .is('deleted_at', null)
-
-  if (employeeId) {
-    consultationsQuery = consultationsQuery.eq('manager_id', employeeId)
-  }
-
-  let activityQuery = supabase
-    .from('daily_activity')
-    .select('fv_fact, sales_fact, revenue_fact')
-    .eq('date', dateStr)
-
-  if (employeeId) {
-    activityQuery = activityQuery.eq('employee_id', employeeId)
-  }
-
-  const [{ data: consults }, { data: activity }] = await Promise.all([consultationsQuery, activityQuery])
+  const [consults, activity] = await Promise.all([
+    query<{ status_after_fv: string | null; actual_status: string | null; amount: number | null }>(
+      `SELECT status_after_fv, actual_status, amount
+         FROM public.consultations
+        WHERE date = $1
+          AND deleted_at IS NULL
+          AND ($2::uuid IS NULL OR manager_id = $2)`,
+      [dateStr, employeeId ?? null],
+    ),
+    query<{ fv_fact: number | null; sales_fact: number | null; revenue_fact: number | null }>(
+      `SELECT fv_fact, sales_fact, revenue_fact
+         FROM public.daily_activity
+        WHERE date = $1
+          AND ($2::uuid IS NULL OR employee_id = $2)`,
+      [dateStr, employeeId ?? null],
+    ),
+  ])
   console.log(`[todayStats] ${Date.now() - t0}ms`)
 
-  const fv_today = consults?.filter(c =>
+  const fv_today = consults.filter(c =>
     c.actual_status !== null
-  ).length ?? 0
+  ).length
 
-  const sales_today = consults?.filter(c =>
+  const sales_today = consults.filter(c =>
     c.status_after_fv === 'Купила' || c.status_after_fv === 'Предоплата'
-  ).length ?? 0
+  ).length
 
-  const revenue_today = consults?.reduce((sum, c) => {
+  const revenue_today = consults.reduce((sum, c) => {
     if (c.status_after_fv === 'Купила' || c.status_after_fv === 'Предоплата') {
       return sum + (Number(c.amount) || 0)
     }
     return sum
-  }, 0) ?? 0
+  }, 0)
 
-  const hasActivity = (activity ?? []).some((row) => row.fv_fact !== null || row.sales_fact !== null || row.revenue_fact !== null)
+  const hasActivity = activity.some((row) => row.fv_fact !== null || row.sales_fact !== null || row.revenue_fact !== null)
   if (!hasActivity) return { fv_today, sales_today, revenue_today }
 
-  return (activity ?? []).reduce((total, row) => ({
+  return activity.reduce((total, row) => ({
     fv_today: total.fv_today + (Number(row.fv_fact) || 0),
     sales_today: total.sales_today + (Number(row.sales_fact) || 0),
     revenue_today: total.revenue_today + (Number(row.revenue_fact) || 0),
@@ -285,38 +281,42 @@ export async function getTodayStats(
 // ─────────────────────────────────────────────
 
 export async function getLiveFeed(
-  supabase: SupabaseClient,
   dateStr: string,
   employeeId?: string,
   limit = 20
 ): Promise<LiveFeedItem[]> {
   const t0 = Date.now()
-  let query = supabase
-    .from('consultations')
-    .select(`
-      id, time, client_name, status_after_fv, actual_status, status, amount, is_nv,
-      employees!consultations_manager_id_fkey(name)
-    `)
-    .eq('date', dateStr)
-    .is('deleted_at', null)
-    .order('time', { ascending: false })
-    .limit(limit)
-
-  if (employeeId) {
-    query = query.eq('manager_id', employeeId)
-  }
-
-  const { data: rows } = await query
+  const rows = await query<{
+    id: string
+    time: string | null
+    client_name: string
+    status_after_fv: LiveFeedItem['status'] | null
+    actual_status: LiveFeedItem['status'] | null
+    status: LiveFeedItem['status'] | null
+    amount: number | null
+    is_nv: boolean | null
+    manager_name: string | null
+  }>(
+    `SELECT c.id, c.time, c.client_name, c.status_after_fv, c.actual_status, c.status, c.amount, c.is_nv,
+            e.name AS manager_name
+       FROM public.consultations c
+       LEFT JOIN public.employees e ON e.id = c.manager_id
+      WHERE c.date = $1
+        AND c.deleted_at IS NULL
+        AND ($2::uuid IS NULL OR c.manager_id = $2)
+      ORDER BY c.time DESC
+      LIMIT $3`,
+    [dateStr, employeeId ?? null, limit],
+  )
   console.log(`[liveFeed] ${Date.now() - t0}ms`)
 
   if (!rows || rows.length === 0) return []
 
-  // ТЕХНИЧЕСКИЙ ДОЛГ: тип employees из Supabase join — массив, приводим через unknown
   return rows.map(row => ({
-    id: row.id as string,
-    time: (row.time as string | null) ?? '00:00',
-    client_name: row.client_name as string,
-    manager_name: (row.employees as unknown as { name: string } | null)?.name ?? 'Неизвестно',
+    id: row.id,
+    time: row.time ?? '00:00',
+    client_name: row.client_name,
+    manager_name: row.manager_name ?? 'Неизвестно',
     status: (row.status_after_fv ?? row.actual_status ?? row.status) as LiveFeedItem['status'],
     amount: Number(row.amount) || 0,
     is_nv: Boolean(row.is_nv),
@@ -328,53 +328,58 @@ export async function getLiveFeed(
 // ─────────────────────────────────────────────
 
 export async function getTeamNow(
-  supabase: SupabaseClient,
   dateStr: string,
   departmentId?: string
 ): Promise<TeamMemberStatus[]> {
   const t0 = Date.now()
-  let empQuery = supabase
-    .from('employees')
-    .select('id, name, avatar_url, role')
-    .eq('status', 'active')
-    .is('deleted_at', null)
-    .not('role', 'eq', 'owner')
-
-  if (departmentId) {
-    empQuery = empQuery.eq('department_id', departmentId)
-  }
-
-  const { data: employees } = await empQuery
+  const employees = await query<{
+    id: string
+    name: string
+    avatar_url: string | null
+    role: UserRole
+  }>(
+    `SELECT id, name, avatar_url, role
+       FROM public.employees
+      WHERE status = 'active'
+        AND deleted_at IS NULL
+        AND role <> 'owner'
+        AND ($1::uuid IS NULL OR department_id = $1)`,
+    [departmentId ?? null],
+  )
   console.log(`[teamNow] employees: ${Date.now() - t0}ms`)
 
   if (!employees || employees.length === 0) return []
 
-  const employeeIds = employees.map(e => e.id as string)
+  const employeeIds = employees.map(e => e.id)
 
-  const { data: attendanceRows } = await supabase
-    .from('attendance')
-    .select('employee_id, status')
-    .eq('date', dateStr)
-    .in('employee_id', employeeIds)
-  console.log(`[teamNow] attendance: ${Date.now() - t0}ms`)
+  const [attendanceRows, todaySales] = await Promise.all([
+    query<{ employee_id: string; status: AttendanceStatus }>(
+      `SELECT employee_id, status
+         FROM public.attendance
+        WHERE date = $1
+          AND employee_id = ANY($2::uuid[])`,
+      [dateStr, employeeIds],
+    ),
+    query<{ manager_id: string; status_after_fv: string | null; actual_status: string | null; amount: number | null }>(
+      `SELECT manager_id, status_after_fv, actual_status, amount
+         FROM public.consultations
+        WHERE date = $1
+          AND manager_id = ANY($2::uuid[])
+          AND deleted_at IS NULL`,
+      [dateStr, employeeIds],
+    ),
+  ])
+  console.log(`[teamNow] attendance+sales: ${Date.now() - t0}ms`)
 
   const attendanceMap = new Map<string, AttendanceStatus>()
-  for (const row of attendanceRows ?? []) {
-    attendanceMap.set(row.employee_id as string, row.status as AttendanceStatus)
+  for (const row of attendanceRows) {
+    attendanceMap.set(row.employee_id, row.status)
   }
 
   // Считаем продажи сегодня
-  const { data: todaySales } = await supabase
-    .from('consultations')
-    .select('manager_id, status_after_fv, actual_status, amount')
-    .eq('date', dateStr)
-    .in('manager_id', employeeIds)
-    .is('deleted_at', null)
-  console.log(`[teamNow] todaySales: ${Date.now() - t0}ms`)
-
   const salesMap = new Map<string, { fv: number; sales: number }>()
-  for (const c of todaySales ?? []) {
-    const mid = c.manager_id as string
+  for (const c of todaySales) {
+    const mid = c.manager_id
     const entry = salesMap.get(mid) ?? { fv: 0, sales: 0 }
     if (c.actual_status !== null) entry.fv += 1
     if (c.status_after_fv === 'Купила' || c.status_after_fv === 'Предоплата') entry.sales += 1
@@ -382,13 +387,13 @@ export async function getTeamNow(
   }
 
   return employees.map(emp => ({
-    id: emp.id as string,
-    name: emp.name as string,
-    avatar_url: emp.avatar_url as string | null,
-    role: emp.role as UserRole,
-    attendance_status: attendanceMap.get(emp.id as string) ?? null,
-    fv_today: salesMap.get(emp.id as string)?.fv ?? 0,
-    sales_today: salesMap.get(emp.id as string)?.sales ?? 0,
+    id: emp.id,
+    name: emp.name,
+    avatar_url: emp.avatar_url,
+    role: emp.role,
+    attendance_status: attendanceMap.get(emp.id) ?? null,
+    fv_today: salesMap.get(emp.id)?.fv ?? 0,
+    sales_today: salesMap.get(emp.id)?.sales ?? 0,
   }))
 }
 
@@ -410,44 +415,48 @@ export interface ScheduleItem {
 }
 
 export async function getTodaySchedule(
-  supabase: SupabaseClient,
   dateStr: string,
   employeeId?: string
 ): Promise<ScheduleItem[]> {
   const t0 = Date.now()
-  let query = supabase
-    .from('consultations')
-    .select(`
-      id, time, client_name, status, actual_status, status_after_fv, amount, is_nv,
-      employees!consultations_manager_id_fkey(name)
-    `)
-    .eq('date', dateStr)
-    .is('deleted_at', null)
-    .order('time', { ascending: true })
-
-  if (employeeId) {
-    query = query.eq('manager_id', employeeId)
-  }
-
-  const { data: rows } = await query
+  const rows = await query<{
+    id: string
+    time: string | null
+    client_name: string
+    status: string | null
+    actual_status: string | null
+    status_after_fv: string | null
+    amount: number | null
+    is_nv: boolean | null
+    manager_name: string | null
+  }>(
+    `SELECT c.id, c.time, c.client_name, c.status, c.actual_status, c.status_after_fv, c.amount, c.is_nv,
+            e.name AS manager_name
+       FROM public.consultations c
+       LEFT JOIN public.employees e ON e.id = c.manager_id
+      WHERE c.date = $1
+        AND c.deleted_at IS NULL
+        AND ($2::uuid IS NULL OR c.manager_id = $2)
+      ORDER BY c.time ASC`,
+    [dateStr, employeeId ?? null],
+  )
   console.log(`[todaySchedule] ${Date.now() - t0}ms`)
 
   if (!rows || rows.length === 0) return []
 
   const nowTime = new Date().toTimeString().substring(0, 5)
 
-  // ТЕХНИЧЕСКИЙ ДОЛГ: тип employees из Supabase join — массив, приводим через unknown
   return rows.map(row => ({
-    id: row.id as string,
-    time: (row.time as string | null) ?? '00:00',
-    client_name: row.client_name as string,
-    status: row.status as string | null,
-    actual_status: row.actual_status as string | null,
-    status_after_fv: row.status_after_fv as string | null,
-    manager_name: (row.employees as unknown as { name: string } | null)?.name ?? '',
+    id: row.id,
+    time: row.time ?? '00:00',
+    client_name: row.client_name,
+    status: row.status,
+    actual_status: row.actual_status,
+    status_after_fv: row.status_after_fv,
+    manager_name: row.manager_name ?? '',
     amount: Number(row.amount) || 0,
     is_nv: Boolean(row.is_nv),
-    isPast: (row.time as string ?? '00:00') < nowTime,
+    isPast: (row.time ?? '00:00') < nowTime,
   }))
 }
 
@@ -466,27 +475,37 @@ export interface TaskBoardSummary {
   mine: number
 }
 
-/**
- * Одним запросом: видимость задач фильтрует RLS (can_see_task), поэтому
- * дополнительных условий по роли здесь нет — считаем по тому, что вернулось.
- */
+// Видимость задачи раньше решала RLS-политика tasks_select через
+// can_see_task(). RLS вместе с Supabase ушла (db/schema.sql), но сам
+// предикат остался обычной SQL-функцией с явным зрителем — тем же, что
+// использует src/actions/tasks.ts. Подставляем его в WHERE напрямую,
+// вместо того чтобы переписывать правило видимости на TypeScript.
+const VIEWER_USER_ID = `(SELECT e.user_id FROM public.employees e WHERE e.id = $1)`
+const CAN_SEE_TASK = `public.can_see_task(
+  ${VIEWER_USER_ID}, t.visibility, t.department_id, t.created_by, t.assignee_id, t.id
+)`
+
 export async function getTaskSummary(
-  supabase: SupabaseClient,
   dateStr: string,
   employeeId?: string
 ): Promise<TaskBoardSummary> {
-  const { data: rows } = await supabase
-    .from('tasks')
-    .select('status, due_date, assignee_id')
-
   const summary: TaskBoardSummary = { active: 0, overdue: 0, dueToday: 0, mine: 0 }
-  for (const row of rows ?? []) {
+  if (!employeeId) return summary
+
+  const rows = await query<{ status: string; due_date: string | null; assignee_id: string | null }>(
+    `SELECT t.status, t.due_date, t.assignee_id
+       FROM public.tasks t
+      WHERE ${CAN_SEE_TASK}`,
+    [employeeId],
+  )
+
+  for (const row of rows) {
     if (row.status === 'done') continue
     summary.active += 1
-    const due = row.due_date as string | null
+    const due = row.due_date
     if (due && due < dateStr) summary.overdue += 1
     if (due === dateStr) summary.dueToday += 1
-    if (employeeId && row.assignee_id === employeeId) summary.mine += 1
+    if (row.assignee_id === employeeId) summary.mine += 1
   }
   return summary
 }
@@ -497,14 +516,14 @@ export async function getTaskSummary(
  * открывает чужие уведомления, и без него счётчик был бы «по всей компании».
  */
 export async function getUnreadNotificationsCount(
-  supabase: SupabaseClient,
   employeeId?: string
 ): Promise<number> {
   if (!employeeId) return 0
-  const { count } = await supabase
-    .from('notifications')
-    .select('id', { count: 'exact', head: true })
-    .eq('employee_id', employeeId)
-    .eq('is_read', false)
-  return count ?? 0
+  const row = await queryOne<{ count: string }>(
+    `SELECT COUNT(*) AS count
+       FROM public.notifications
+      WHERE employee_id = $1 AND is_read = FALSE`,
+    [employeeId],
+  )
+  return row ? Number(row.count) : 0
 }

@@ -1,4 +1,3 @@
-import { createTokenClient } from '@/lib/supabase/token-client'
 import {
   getTodayStats,
   getLiveFeed,
@@ -42,28 +41,19 @@ export default async function RightPanel({
   permissionLevel,
   employeeId,
   departmentId,
-  accessToken,
 }: RightPanelProps) {
-  // Используем token-клиент вместо createClient() + cookies(),
-  // так как cookies() нельзя вызывать внутри Suspense во время стриминга.
-  //
-  // ВАЖНО: accessToken не должен передаваться в дочерние Client Components,
-  // и этот файл не должен получать директиву 'use client' —
-  // иначе токен попадёт в JS-бандл и станет виден в браузере.
-  const supabase = createTokenClient(accessToken)
-
   // permissionLevel используется для поддержки пользовательских ролей.
   const effectiveLevel = permissionLevel ?? (role === 'mp' || role === 'lmai' ? 'employee' : role === 'rop' ? 'department_head' : 'owner')
   const filterById = effectiveLevel === 'employee' ? employeeId : undefined
   const filterDept = effectiveLevel === 'department_head' ? (departmentId ?? undefined) : undefined
 
   const [todayStats, feedItems, teamMembers, scheduleItems] = await Promise.all([
-    getTodayStats(supabase, dateStr, filterById),
-    getLiveFeed(supabase, dateStr, filterById),
+    getTodayStats(dateStr, filterById),
+    getLiveFeed(dateStr, filterById),
     (effectiveLevel === 'owner' || effectiveLevel === 'department_head')
-      ? getTeamNow(supabase, dateStr, filterDept)
+      ? getTeamNow(dateStr, filterDept)
       : Promise.resolve([]),
-    getTodaySchedule(supabase, dateStr, filterById),
+    getTodaySchedule(dateStr, filterById),
   ])
 
   const currentTime = new Date().toTimeString().substring(0, 5)

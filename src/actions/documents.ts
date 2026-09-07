@@ -1,7 +1,8 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
-import { createClient } from '@/lib/supabase/server'
+import { query, queryOne } from '@/lib/db'
+import { getActor } from '@/lib/auth/actor'
 import type { Document, DocumentFolder, DocumentCategory } from '@/types'
 
 // ─── Результат действия ──────────────────────────────────────────────────────
@@ -12,25 +13,6 @@ export type ActionResult<T = undefined> =
 
 const BUCKET = 'documents'
 
-// ─── Текущий сотрудник ───────────────────────────────────────────────────────
-
-interface Viewer { id: string; role: string }
-
-async function getViewer(): Promise<Viewer | null> {
-  const supabase = await createClient()
-  const { data: { session } } = await supabase.auth.getSession()
-  if (!session) return null
-
-  const { data } = await supabase
-    .from('employees')
-    .select('id, role')
-    .eq('user_id', session.user.id)
-    .is('deleted_at', null)
-    .maybeSingle()
-
-  return (data as Viewer | null) ?? null
-}
-
 // ─── Просмотр папки ──────────────────────────────────────────────────────────
 
 export interface FolderContents {
@@ -39,57 +21,67 @@ export interface FolderContents {
   breadcrumb: DocumentFolder[]
 }
 
-async function buildBreadcrumb(
-  supabase: Awaited<ReturnType<typeof createClient>>,
-  folderId: string | null
-): Promise<DocumentFolder[]> {
+async function buildBreadcrumb(folderId: string | null): Promise<DocumentFolder[]> {
   const path: DocumentFolder[] = []
   let currentId = folderId
   // Небольшая иерархия папок — обход по одной без риска зависнуть.
   for (let i = 0; i < 50 && currentId; i++) {
-    const { data } = await supabase
-      .from('document_folders')
-      .select('id, name, parent_id, created_by, created_at')
-      .eq('id', currentId)
-      .maybeSingle()
+    const data = await queryOne<DocumentFolder>(
+      `SELECT id, name, parent_id, created_by, created_at
+         FROM public.document_folders
+        WHERE id = $1`,
+      [currentId],
+    )
     if (!data) break
-    path.unshift(data as DocumentFolder)
-    currentId = (data as DocumentFolder).parent_id
+    path.unshift(data)
+    currentId = data.parent_id
   }
   return path
 }
 
+interface DocumentRow extends Omit<Document, 'uploader'> {
+  uploader_id: string | null
+  uploader_name: string | null
+}
+
+function toDocument(row: DocumentRow): Document {
+  const { uploader_id, uploader_name, ...rest } = row
+  return {
+    ...rest,
+    uploader: uploader_id ? { id: uploader_id, name: uploader_name as string } : undefined,
+  }
+}
+
 export async function listFolder(folderId: string | null): Promise<ActionResult<FolderContents>> {
-  const me = await getViewer()
-  if (!me) return { success: false, error: 'Не авторизован' }
+  const actor = await getActor()
+  if (!actor) return { success: false, error: 'Не авторизован' }
 
-  const supabase = await createClient()
-
-  const foldersQuery = supabase
-    .from('document_folders')
-    .select('id, name, parent_id, created_by, created_at')
-    .order('name')
-  const docsQuery = supabase
-    .from('documents')
-    .select('*, uploader:employees(id, name)')
-    .is('deleted_at', null)
-    .order('created_at', { ascending: false })
-
-  const [{ data: folders, error: foldersError }, { data: docs, error: docsError }] = await Promise.all([
-    folderId ? foldersQuery.eq('parent_id', folderId) : foldersQuery.is('parent_id', null),
-    folderId ? docsQuery.eq('folder_id', folderId) : docsQuery.is('folder_id', null),
+  const [folders, docRows] = await Promise.all([
+    query<DocumentFolder>(
+      `SELECT id, name, parent_id, created_by, created_at
+         FROM public.document_folders
+        WHERE parent_id IS NOT DISTINCT FROM $1
+        ORDER BY name`,
+      [folderId],
+    ),
+    query<DocumentRow>(
+      `SELECT d.*, e.id AS uploader_id, e.name AS uploader_name
+         FROM public.documents d
+         LEFT JOIN public.employees e ON e.id = d.uploaded_by
+        WHERE d.deleted_at IS NULL
+          AND d.folder_id IS NOT DISTINCT FROM $1
+        ORDER BY d.created_at DESC`,
+      [folderId],
+    ),
   ])
 
-  if (foldersError) return { success: false, error: foldersError.message }
-  if (docsError) return { success: false, error: docsError.message }
-
-  const breadcrumb = await buildBreadcrumb(supabase, folderId)
+  const breadcrumb = await buildBreadcrumb(folderId)
 
   return {
     success: true,
     data: {
-      folders: (folders as DocumentFolder[]) ?? [],
-      documents: (docs as Document[]) ?? [],
+      folders,
+      documents: docRows.map(toDocument),
       breadcrumb,
     },
   }
@@ -98,40 +90,45 @@ export async function listFolder(folderId: string | null): Promise<ActionResult<
 // ─── Папки ───────────────────────────────────────────────────────────────────
 
 export async function createFolder(name: string, parentId: string | null): Promise<ActionResult<DocumentFolder>> {
-  const me = await getViewer()
-  if (!me) return { success: false, error: 'Не авторизован' }
+  const actor = await getActor()
+  if (!actor) return { success: false, error: 'Не авторизован' }
   const trimmed = name.trim()
   if (!trimmed) return { success: false, error: 'Название не может быть пустым' }
 
-  const supabase = await createClient()
-  const { data, error } = await supabase
-    .from('document_folders')
-    .insert({ name: trimmed, parent_id: parentId, created_by: me.id })
-    .select('id, name, parent_id, created_by, created_at')
-    .single()
+  const data = await queryOne<DocumentFolder>(
+    `INSERT INTO public.document_folders (name, parent_id, created_by)
+     VALUES ($1, $2, $3)
+     RETURNING id, name, parent_id, created_by, created_at`,
+    [trimmed, parentId, actor.employeeId],
+  )
 
-  if (error) return { success: false, error: error.message }
   revalidatePath('/dashboard/documents')
   return { success: true, data: data as DocumentFolder }
 }
 
 export async function deleteFolder(id: string): Promise<ActionResult> {
-  const me = await getViewer()
-  if (!me) return { success: false, error: 'Не авторизован' }
+  const actor = await getActor()
+  if (!actor) return { success: false, error: 'Не авторизован' }
 
-  const supabase = await createClient()
-
-  const [{ count: subfolderCount }, { count: docCount }] = await Promise.all([
-    supabase.from('document_folders').select('id', { count: 'exact', head: true }).eq('parent_id', id),
-    supabase.from('documents').select('id', { count: 'exact', head: true }).eq('folder_id', id).is('deleted_at', null),
+  const [subfolderRow, docRow] = await Promise.all([
+    queryOne<{ count: string }>(
+      `SELECT COUNT(*) AS count FROM public.document_folders WHERE parent_id = $1`,
+      [id],
+    ),
+    queryOne<{ count: string }>(
+      `SELECT COUNT(*) AS count FROM public.documents WHERE folder_id = $1 AND deleted_at IS NULL`,
+      [id],
+    ),
   ])
 
-  if ((subfolderCount ?? 0) > 0 || (docCount ?? 0) > 0) {
+  const subfolderCount = Number(subfolderRow?.count ?? 0)
+  const docCount = Number(docRow?.count ?? 0)
+
+  if (subfolderCount > 0 || docCount > 0) {
     return { success: false, error: 'Папка не пуста — сначала удалите файлы и подпапки' }
   }
 
-  const { error } = await supabase.from('document_folders').delete().eq('id', id)
-  if (error) return { success: false, error: error.message }
+  await query(`DELETE FROM public.document_folders WHERE id = $1`, [id])
   revalidatePath('/dashboard/documents')
   return { success: true }
 }
@@ -139,8 +136,8 @@ export async function deleteFolder(id: string): Promise<ActionResult> {
 // ─── Документы ───────────────────────────────────────────────────────────────
 
 export async function uploadDocument(formData: FormData): Promise<ActionResult<Document>> {
-  const me = await getViewer()
-  if (!me) return { success: false, error: 'Не авторизован' }
+  const actor = await getActor()
+  if (!actor) return { success: false, error: 'Не авторизован' }
 
   const file = formData.get('file') as File | null
   if (!file || file.size === 0) return { success: false, error: 'Файл не выбран' }
@@ -148,62 +145,70 @@ export async function uploadDocument(formData: FormData): Promise<ActionResult<D
   const folderId = (formData.get('folderId') as string | null) || null
   const category = ((formData.get('category') as string | null) || 'other') as DocumentCategory
 
-  const supabase = await createClient()
-
   const safeName = file.name.replace(/[^\w.\-А-Яа-яёЁ ]/g, '_')
   const storagePath = `${folderId ?? 'root'}/${crypto.randomUUID()}-${safeName}`
 
-  const { error: uploadError } = await supabase.storage
-    .from(BUCKET)
-    .upload(storagePath, file, { contentType: file.type || undefined })
-  if (uploadError) return { success: false, error: `Не удалось загрузить файл: ${uploadError.message}` }
+  // TODO(storage): Supabase Storage (`supabase.storage.from(BUCKET).upload(...)`)
+  // is not available post-migration, and there is no established replacement
+  // (no S3/R2/local-filesystem writer exists anywhere in this repo yet —
+  // db/schema.sql explicitly calls storage buckets "out of scope" for now,
+  // see the comment above `documents` table). Uploading the actual file bytes
+  // is blocked until a storage backend is chosen and wired up. This action
+  // still records the row (`storage_path` is populated so the schema/consumers
+  // don't need to change) but the file itself is NOT persisted anywhere.
+  void BUCKET
 
-  const { data, error: insertError } = await supabase
-    .from('documents')
-    .insert({
-      name: file.name,
-      original_name: file.name,
-      category,
-      storage_path: storagePath,
-      mime_type: file.type || null,
-      size_bytes: file.size,
-      uploaded_by: me.id,
-      folder_id: folderId,
-    })
-    .select('*, uploader:employees(id, name)')
-    .single()
+  try {
+    const row = await queryOne<DocumentRow>(
+      `INSERT INTO public.documents
+         (name, original_name, category, storage_path, mime_type, size_bytes, uploaded_by, folder_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING documents.*,
+         (SELECT id FROM public.employees WHERE id = documents.uploaded_by) AS uploader_id,
+         (SELECT name FROM public.employees WHERE id = documents.uploaded_by) AS uploader_name`,
+      [
+        file.name,
+        file.name,
+        category,
+        storagePath,
+        file.type || null,
+        file.size,
+        actor.employeeId,
+        folderId,
+      ],
+    )
 
-  if (insertError) {
-    // Метаданные не записались — не оставляем сиротский файл в Storage.
-    await supabase.storage.from(BUCKET).remove([storagePath])
-    return { success: false, error: insertError.message }
+    revalidatePath('/dashboard/documents')
+    return { success: true, data: toDocument(row as DocumentRow) }
+  } catch (e) {
+    const err = e as { code?: string; message: string }
+    console.error('[uploadDocument] insert:', err.code, err.message)
+    return { success: false, error: err.message }
   }
-
-  revalidatePath('/dashboard/documents')
-  return { success: true, data: data as Document }
 }
 
 export async function deleteDocument(id: string): Promise<ActionResult> {
-  const me = await getViewer()
-  if (!me) return { success: false, error: 'Не авторизован' }
+  const actor = await getActor()
+  if (!actor) return { success: false, error: 'Не авторизован' }
 
-  const supabase = await createClient()
-  const { error } = await supabase
-    .from('documents')
-    .update({ deleted_at: new Date().toISOString() })
-    .eq('id', id)
+  await query(
+    `UPDATE public.documents SET deleted_at = NOW() WHERE id = $1`,
+    [id],
+  )
 
-  if (error) return { success: false, error: error.message }
   revalidatePath('/dashboard/documents')
   return { success: true }
 }
 
 export async function getSignedUrl(storagePath: string): Promise<ActionResult<string>> {
-  const me = await getViewer()
-  if (!me) return { success: false, error: 'Не авторизован' }
+  const actor = await getActor()
+  if (!actor) return { success: false, error: 'Не авторизован' }
 
-  const supabase = await createClient()
-  const { data, error } = await supabase.storage.from(BUCKET).createSignedUrl(storagePath, 60)
-  if (error || !data) return { success: false, error: error?.message ?? 'Не удалось получить ссылку' }
-  return { success: true, data: data.signedUrl }
+  // TODO(storage): Supabase Storage signed URLs (`supabase.storage.from(BUCKET)
+  // .createSignedUrl(...)`) have no replacement yet — see the TODO in
+  // uploadDocument above. Blocked until a storage backend (S3/R2/local) is
+  // chosen; there is nothing to sign a URL for since files are not being
+  // persisted anywhere post-migration.
+  void storagePath
+  return { success: false, error: 'Хранилище файлов недоступно: перенос со Supabase Storage ещё не выполнен' }
 }

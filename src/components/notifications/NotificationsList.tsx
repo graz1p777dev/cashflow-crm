@@ -1,12 +1,11 @@
 'use client'
 
-import { useEffect, useMemo, useState, useTransition } from 'react'
+import { useEffect, useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { Bell, Check, CheckCheck } from 'lucide-react'
-import { createClient } from '@/lib/supabase/client'
 import { useAuth } from '@/contexts/AuthContext'
-import { markAllNotificationsRead, markNotificationRead } from '@/actions/notifications'
+import { getNotifications, markAllNotificationsRead, markNotificationRead } from '@/actions/notifications'
 import { NOTIFICATION_TYPE_MAP } from '@/lib/constants'
 import type { Notification } from '@/types'
 
@@ -29,20 +28,16 @@ export default function NotificationsList({
   const [isPending, startTransition] = useTransition()
   const { user } = useAuth()
   const router = useRouter()
-  const supabase = useMemo(() => createClient(), [])
 
+  // Раньше — Supabase Realtime-подписка на INSERT в notifications; на
+  // Postgres без Realtime — поллинг всего списка под текущий фильтр.
   useEffect(() => {
     if (!user?.id) return
-    const channel = supabase
-      .channel('notifications-page')
-      .on(
-        'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'notifications', filter: `employee_id=eq.${user.id}` },
-        (payload) => setItems(prev => [payload.new as Notification, ...prev])
-      )
-      .subscribe()
-    return () => { supabase.removeChannel(channel) }
-  }, [user?.id, supabase])
+    const interval = setInterval(() => {
+      getNotifications(initialFilter).then(setItems)
+    }, 8000)
+    return () => clearInterval(interval)
+  }, [user?.id, initialFilter])
 
   const unreadCount = items.filter(n => !n.is_read).length
 

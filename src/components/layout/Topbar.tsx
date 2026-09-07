@@ -1,11 +1,11 @@
 'use client'
 import { usePathname } from 'next/navigation'
-import { useEffect, useState, useMemo } from 'react'
+import { useEffect, useState } from 'react'
 import { Bell, Menu } from 'lucide-react'
 import Link from 'next/link'
 import { useAuth } from '@/contexts/AuthContext'
 import { NAV_GROUPS } from '@/config/nav'
-import { createClient } from '@/lib/supabase/client'
+import { getUnreadNotificationsCount } from '@/actions/notifications'
 import { getInitials, formatDateFull } from '@/lib/formatters'
 import { ROLE_LABELS } from '@/lib/constants'
 import type { UserRole } from '@/types'
@@ -46,41 +46,23 @@ export default function Topbar({ onMenuClick }: { onMenuClick?: () => void }) {
   const { user } = useAuth()
   const [unreadCount, setUnreadCount] = useState(0)
   const [profileOpen, setProfileOpen] = useState(false)
-  const supabase = useMemo(() => createClient(), [])
 
   const role = user?.role as UserRole | undefined
   const today = formatDateFull(new Date().toISOString())
 
+  // Раньше — Supabase Realtime-подписка на INSERT в notifications; на
+  // Postgres без Realtime — поллинг счётчика.
   useEffect(() => {
     if (!user?.id) return
 
-    const fetchUnread = async () => {
-      const { count } = await supabase
-        .from('notifications')
-        .select('id', { count: 'exact', head: true })
-        .eq('employee_id', user.id)
-        .eq('is_read', false)
-      setUnreadCount(count ?? 0)
+    const fetchUnread = () => {
+      getUnreadNotificationsCount().then(setUnreadCount)
     }
 
     fetchUnread()
-
-    const channel = supabase
-      .channel('topbar-notifications')
-      .on(
-        'postgres_changes',
-        {
-          event: 'INSERT',
-          schema: 'public',
-          table: 'notifications',
-          filter: `employee_id=eq.${user.id}`,
-        },
-        () => fetchUnread()
-      )
-      .subscribe()
-
-    return () => { supabase.removeChannel(channel) }
-  }, [user?.id, supabase])
+    const interval = setInterval(fetchUnread, 8000)
+    return () => clearInterval(interval)
+  }, [user?.id])
 
   return (
     <header

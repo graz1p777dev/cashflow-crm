@@ -16,7 +16,7 @@
 // уведомления и отмечал их прочитанными.
 
 import { revalidatePath } from 'next/cache'
-import { query } from '@/lib/db'
+import { query, queryOne } from '@/lib/db'
 import { getActor } from '@/lib/auth/actor'
 import type { Notification } from '@/types'
 
@@ -41,6 +41,21 @@ export async function getNotifications(filter: 'all' | 'important' = 'all'): Pro
       LIMIT 100`,
     [actor.employeeId, actor.role, filter === 'important'],
   )
+}
+
+/** Счётчик для колокольчика в Topbar — Topbar поллит эту функцию вместо
+ * Supabase Realtime-подписки на INSERT в notifications. */
+export async function getUnreadNotificationsCount(): Promise<number> {
+  const actor = await getActor()
+  if (!actor) return 0
+
+  const row = await queryOne<{ count: string }>(
+    `SELECT count(*)::text AS count
+       FROM public.notifications n
+      WHERE n.is_read = FALSE AND ${VISIBLE}`,
+    [actor.employeeId, actor.role],
+  )
+  return row ? Number(row.count) : 0
 }
 
 export async function markNotificationRead(id: string): Promise<ActionResult> {

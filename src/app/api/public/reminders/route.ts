@@ -7,7 +7,7 @@
 // в это же время» с запасом на то, что бот проснулся чуть позже.
 
 import { NextResponse } from 'next/server'
-import { createAdminClient } from '@/lib/supabase/admin'
+import { query } from '@/lib/db'
 import { guardBotRequest } from '@/lib/public-api'
 
 export const dynamic = 'force-dynamic'
@@ -20,46 +20,51 @@ export async function GET(request: Request) {
   const raw = new URL(request.url).searchParams.get('withinHours')
   const hours = Math.min(72, Math.max(1, Number(raw) || 26))
 
-  const admin = createAdminClient()
-  const { data, error } = await admin
-    .from('game_bookings')
-    .select('id, name, seats, status, telegram_chat_id, games!inner(id, title, starts_at, venue, status, deleted_at)')
-    .not('telegram_chat_id', 'is', null)
-    .in('status', ['booked', 'confirmed'])
-    .gte('games.starts_at', new Date().toISOString())
-    .lte('games.starts_at', new Date(Date.now() + hours * 3600_000).toISOString())
-    .eq('games.status', 'planned')
-    .is('games.deleted_at', null)
-
-  if (error) {
-    console.error('public/reminders failed', error.message)
-    return NextResponse.json({ error: 'Database error' }, { status: 500 })
-  }
-
   type Row = {
     id: string
     name: string
     seats: number
     status: string
     telegram_chat_id: number
-    games: { id: string; title: string; starts_at: string; venue: string } | null
+    game_id: string
+    game_title: string
+    game_starts_at: string
+    game_venue: string
+  }
+
+  let rows: Row[]
+  try {
+    rows = await query<Row>(
+      `SELECT b.id, b.name, b.seats, b.status, b.telegram_chat_id,
+              g.id AS game_id, g.title AS game_title, g.starts_at AS game_starts_at, g.venue AS game_venue
+         FROM public.game_bookings b
+         JOIN public.games g ON g.id = b.game_id
+        WHERE b.telegram_chat_id IS NOT NULL
+          AND b.status IN ('booked', 'confirmed')
+          AND g.starts_at >= $1
+          AND g.starts_at <= $2
+          AND g.status = 'planned'
+          AND g.deleted_at IS NULL`,
+      [new Date().toISOString(), new Date(Date.now() + hours * 3600_000).toISOString()],
+    )
+  } catch (e) {
+    console.error('public/reminders failed', e instanceof Error ? e.message : e)
+    return NextResponse.json({ error: 'Database error' }, { status: 500 })
   }
 
   return NextResponse.json({
-    reminders: ((data ?? []) as unknown as Row[])
-      .filter((b) => b.games)
-      .map((b) => ({
-        bookingId: b.id,
-        chatId: b.telegram_chat_id,
-        name: b.name,
-        seats: b.seats,
-        status: b.status,
-        game: {
-          id: b.games!.id,
-          title: b.games!.title,
-          startsAt: b.games!.starts_at,
-          venue: b.games!.venue,
-        },
-      })),
+    reminders: rows.map((b) => ({
+      bookingId: b.id,
+      chatId: b.telegram_chat_id,
+      name: b.name,
+      seats: b.seats,
+      status: b.status,
+      game: {
+        id: b.game_id,
+        title: b.game_title,
+        startsAt: b.game_starts_at,
+        venue: b.game_venue,
+      },
+    })),
   })
 }

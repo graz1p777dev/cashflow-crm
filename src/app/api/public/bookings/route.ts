@@ -153,6 +153,7 @@ export async function POST(request: Request) {
     title: `Запись на игру: ${name}`,
     body: `${g.title} · мест: ${seats}${payload.phone ? ` · ${payload.phone}` : ''}`,
     actionUrl: '/dashboard/games',
+    isImportant: true,
     sourceType: 'game',
     sourceId: g.id,
   })

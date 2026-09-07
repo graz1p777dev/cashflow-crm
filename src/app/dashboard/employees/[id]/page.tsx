@@ -1,6 +1,6 @@
 import { notFound } from 'next/navigation'
 import Link from 'next/link'
-import { createAdminClient } from '@/lib/supabase/admin'
+import { queryOne } from '@/lib/db'
 import { ArrowLeft, User, Mail, Phone, Calendar, Briefcase, TrendingUp, Wallet } from 'lucide-react'
 
 // ─── Типы ────────────────────────────────────────────────────────────────────
@@ -11,7 +11,7 @@ interface RawEmployee {
   base_salary: number; kpi_coefficient: number; schedule_type: string
   work_start_time: string; work_end_time: string; notes: string | null
   deleted_at: string | null
-  departments: { name: string } | null
+  department_name: string | null
 }
 
 interface RawDecomp {
@@ -54,38 +54,39 @@ function kpiBg(pct: number) {
 // ─── Сервер-компонент ─────────────────────────────────────────────────────────
 
 export default async function EmployeeCardPage({ params }: { params: { id: string } }) {
-  const admin = createAdminClient()
   const now   = new Date()
   const year  = now.getFullYear()
-  const month = now.getMonth() + 1   // Supabase хранит как SMALLINT 1–12
+  const month = now.getMonth() + 1   // хранится как SMALLINT 1–12
 
-  const [empRes, decompRes, kpiPlanRes] = await Promise.all([
-    admin
-      .from('employees')
-      .select('id,name,email,phone,role,status,hire_date,birth_date,base_salary,kpi_coefficient,schedule_type,work_start_time,work_end_time,notes,deleted_at,departments(name)')
-      .eq('id', params.id)
-      .single(),
-    admin
-      .from('sales_plan_weekly')
-      .select('total_fv_plan,total_fv_fact,total_sales_plan,total_sales_fact,total_revenue_plan,total_revenue_fact,kpi_pct')
-      .eq('employee_id', params.id)
-      .eq('period_year', year)
-      .eq('period_month', month)
-      .maybeSingle(),
-    admin
-      .from('employee_kpi')
-      .select('plan_fv,plan_sales,plan_revenue,plan_work_days')
-      .eq('employee_id', params.id)
-      .eq('period_year', year)
-      .eq('period_month', month)
-      .maybeSingle(),
+  const [emp, decomp, plan] = await Promise.all([
+    queryOne<RawEmployee>(
+      `SELECT e.id, e.name, e.email, e.phone, e.role, e.status, e.hire_date, e.birth_date,
+              e.base_salary, e.kpi_coefficient, e.schedule_type, e.work_start_time,
+              e.work_end_time, e.notes, e.deleted_at, d.name AS department_name
+         FROM public.employees e
+         LEFT JOIN public.departments d ON d.id = e.department_id
+        WHERE e.id = $1
+        LIMIT 1`,
+      [params.id],
+    ),
+    queryOne<RawDecomp>(
+      `SELECT total_fv_plan, total_fv_fact, total_sales_plan, total_sales_fact,
+              total_revenue_plan, total_revenue_fact, kpi_pct
+         FROM public.sales_plan_weekly
+        WHERE employee_id = $1 AND period_year = $2 AND period_month = $3
+        LIMIT 1`,
+      [params.id, year, month],
+    ),
+    queryOne<{ plan_fv: number | null; plan_sales: number | null; plan_revenue: number | null; plan_work_days: number | null }>(
+      `SELECT plan_fv, plan_sales, plan_revenue, plan_work_days
+         FROM public.employee_kpi
+        WHERE employee_id = $1 AND period_year = $2 AND period_month = $3
+        LIMIT 1`,
+      [params.id, year, month],
+    ),
   ])
 
-  if (empRes.error || !empRes.data) notFound()
-
-  const emp    = empRes.data as unknown as RawEmployee
-  const decomp = decompRes.data as unknown as RawDecomp | null
-  const plan   = kpiPlanRes.data
+  if (!emp) notFound()
 
   const kpiPct    = Math.round(decomp?.kpi_pct ?? 0)
   const bonus     = emp.base_salary > 0
@@ -94,7 +95,7 @@ export default async function EmployeeCardPage({ params }: { params: { id: strin
   const totalSalary = emp.base_salary + bonus
   const statusInfo  = STATUS_LABELS[emp.status] ?? STATUS_LABELS.active
 
-  const deptName = (emp.departments as unknown as { name: string } | null)?.name ?? null
+  const deptName = emp.department_name
 
   return (
     <div className="min-h-screen" style={{ backgroundColor: '#fdfbfb' }}>

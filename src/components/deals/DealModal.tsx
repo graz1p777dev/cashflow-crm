@@ -294,7 +294,7 @@ export default function DealModal({
             </div>
           </div>
 
-          <div className="grid grid-cols-[1fr_120px] gap-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-[1fr_120px]">
             <div className="space-y-1.5">
               <Label>Сумма</Label>
               <Input
@@ -347,7 +347,7 @@ export default function DealModal({
             </div>
           </div>
 
-          <div className="grid grid-cols-[180px_1fr] gap-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-[180px_1fr]">
             <div className="space-y-1.5">
               <Label>Город</Label>
               <Input

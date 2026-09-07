@@ -1,8 +1,8 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
-import { createClient } from '@/lib/supabase/server'
-import { createAdminClient } from '@/lib/supabase/admin'
+import { query, queryOne, transaction } from '@/lib/db'
+import { getActor, isOwner } from '@/lib/auth/actor'
 
 export type ActionResult = { success: true } | { success: false; error: string }
 
@@ -46,98 +46,106 @@ export interface KpiRoleSetting {
   kpi_items: KpiItem[]
 }
 
-// ─── Auth guard ────────────────────────────────────────────────────────────────
-
-async function requireOwner(): Promise<boolean> {
-  const supabase = await createClient()
-  const { data: { session } } = await supabase.auth.getSession()
-  if (!session) return false
-  const { data } = await supabase
-    .from('employees')
-    .select('role')
-    .eq('user_id', session.user.id)
-    .single()
-  return data?.role === 'owner'
-}
-
 // ─── Роли ─────────────────────────────────────────────────────────────────────
 
 export async function getRolesForKpi(): Promise<RoleOption[]> {
-  const supabase = await createClient()
-  const { data: { session } } = await supabase.auth.getSession()
-  if (!session) return []
-  const { data } = await supabase
-    .from('roles')
-    .select('name, label')
-    .is('deleted_at', null)
-    .order('created_at')
-  return (data ?? []) as RoleOption[]
+  const actor = await getActor()
+  if (!actor) return []
+  return query<RoleOption>(
+    `SELECT name, label FROM public.roles
+      WHERE deleted_at IS NULL
+      ORDER BY created_at`,
+  )
 }
 
 // ─── Получить или создать настройки KPI для роли ──────────────────────────────
 
-export async function getOrCreateKpiRoleSetting(roleName: string): Promise<KpiRoleSetting | null> {
-  const supabase = await createClient()
-  const { data: { session } } = await supabase.auth.getSession()
-  if (!session) return null
-  const admin = createAdminClient()
+interface KpiRoleSettingRow {
+  id: string
+  role_name: string
+  is_active: boolean
+  salary_type: 'fixed' | 'per_shift' | null
+  salary_amount: number | null
+  rate_per_shift: number | null
+}
 
-  let { data: setting } = await admin
-    .from('kpi_role_settings')
-    .select('id, role_name, is_active, salary_type, salary_amount, rate_per_shift')
-    .eq('role_name', roleName)
-    .maybeSingle()
+export async function getOrCreateKpiRoleSetting(roleName: string): Promise<KpiRoleSetting | null> {
+  const actor = await getActor()
+  if (!actor) return null
+
+  let setting = await queryOne<KpiRoleSettingRow>(
+    `SELECT id, role_name, is_active, salary_type, salary_amount, rate_per_shift
+       FROM public.kpi_role_settings
+      WHERE role_name = $1
+      LIMIT 1`,
+    [roleName],
+  )
 
   if (!setting) {
-    const { data: created, error } = await admin
-      .from('kpi_role_settings')
-      .insert({ role_name: roleName, is_active: true })
-      .select('id, role_name, is_active, salary_type, salary_amount, rate_per_shift')
-      .single()
-    if (error || !created) return null
+    const created = await transaction(async (client) => {
+      const res = await client.query<KpiRoleSettingRow>(
+        `INSERT INTO public.kpi_role_settings (role_name, is_active)
+         VALUES ($1, TRUE)
+         RETURNING id, role_name, is_active, salary_type, salary_amount, rate_per_shift`,
+        [roleName],
+      )
+      const row = res.rows[0]
+      if (!row) return null
 
-    // Создаём два базовых блока для новой роли
-    await admin.from('kpi_bonus_blocks').insert([
-      { role_setting_id: created.id, name: 'Бонус за выполнение плана', block_type: 'plan', value_label_from: '%', value_label_to: '%', sort_order: 0 },
-      { role_setting_id: created.id, name: 'Ежедневный бонус', block_type: 'daily', value_label_from: 'сом', value_label_to: 'сом', sort_order: 1 },
-    ])
+      // Создаём два базовых блока для новой роли
+      await client.query(
+        `INSERT INTO public.kpi_bonus_blocks
+           (role_setting_id, name, block_type, value_label_from, value_label_to, sort_order)
+         VALUES
+           ($1, 'Бонус за выполнение плана', 'plan', '%', '%', 0),
+           ($1, 'Ежедневный бонус', 'daily', 'сом', 'сом', 1)`,
+        [row.id],
+      )
+      return row
+    })
+    if (!created) return null
     setting = created
   }
 
   // Загружаем блоки с их тирами
-  const { data: blocks } = await admin
-    .from('kpi_bonus_blocks')
-    .select('id, name, block_type, value_label_from, value_label_to, sort_order')
-    .eq('role_setting_id', setting.id)
-    .order('sort_order')
+  const blocks = await query<Omit<BonusBlock, 'tiers'>>(
+    `SELECT id, name, block_type, value_label_from, value_label_to, sort_order
+       FROM public.kpi_bonus_blocks
+      WHERE role_setting_id = $1
+      ORDER BY sort_order`,
+    [setting.id],
+  )
 
   const blocksWithTiers: BonusBlock[] = await Promise.all(
-    (blocks ?? []).map(async (b) => {
-      const { data: tiers } = await admin
-        .from('kpi_bonus_tiers')
-        .select('id, tier_from, tier_to, bonus_amount, sort_order')
-        .eq('block_id', b.id)
-        .order('sort_order')
-      return { ...b, tiers: (tiers ?? []) as BonusTier[] } as BonusBlock
+    blocks.map(async (b) => {
+      const tiers = await query<BonusTier>(
+        `SELECT id, tier_from, tier_to, bonus_amount, sort_order
+           FROM public.kpi_bonus_tiers
+          WHERE block_id = $1
+          ORDER BY sort_order`,
+        [b.id],
+      )
+      return { ...b, tiers }
     })
   )
 
-  const { data: kpiItems } = await admin
-    .from('kpi_items')
-    .select('id, name, description, bonus_amount, sort_order, is_active')
-    .eq('role_setting_id', setting.id)
-    .eq('is_active', true)
-    .order('sort_order')
+  const kpiItems = await query<KpiItem>(
+    `SELECT id, name, description, bonus_amount, sort_order, is_active
+       FROM public.kpi_items
+      WHERE role_setting_id = $1 AND is_active = TRUE
+      ORDER BY sort_order`,
+    [setting.id],
+  )
 
   return {
-    id:            setting.id as string,
-    role_name:     setting.role_name as string,
-    is_active:     setting.is_active as boolean,
-    salary_type:   (setting.salary_type ?? 'fixed') as 'fixed' | 'per_shift',
-    salary_amount: setting.salary_amount as number ?? 0,
-    rate_per_shift: setting.rate_per_shift as number ?? 0,
-    bonus_blocks:  blocksWithTiers,
-    kpi_items:     (kpiItems ?? []) as KpiItem[],
+    id:             setting.id,
+    role_name:      setting.role_name,
+    is_active:      setting.is_active,
+    salary_type:    setting.salary_type ?? 'fixed',
+    salary_amount:  setting.salary_amount ?? 0,
+    rate_per_shift: setting.rate_per_shift ?? 0,
+    bonus_blocks:   blocksWithTiers,
+    kpi_items:      kpiItems,
   }
 }
 
@@ -149,13 +157,18 @@ export async function saveSalarySettings(
   salaryAmount: number,
   ratePerShift: number,
 ): Promise<ActionResult> {
-  if (!await requireOwner()) return { success: false, error: 'Недостаточно прав' }
-  const admin = createAdminClient()
-  const { error } = await admin
-    .from('kpi_role_settings')
-    .update({ salary_type: salaryType, salary_amount: salaryAmount, rate_per_shift: ratePerShift })
-    .eq('id', roleSettingId)
-  if (error) return { success: false, error: error.message }
+  if (!await isOwner()) return { success: false, error: 'Недостаточно прав' }
+  try {
+    await query(
+      `UPDATE public.kpi_role_settings
+          SET salary_type = $2, salary_amount = $3, rate_per_shift = $4
+        WHERE id = $1`,
+      [roleSettingId, salaryType, salaryAmount, ratePerShift],
+    )
+  } catch (e) {
+    const err = e as { message?: string }
+    return { success: false, error: err.message ?? 'Ошибка сохранения' }
+  }
   revalidatePath('/dashboard/settings')
   return { success: true }
 }
@@ -166,22 +179,22 @@ export async function saveBonusTiers(
   blockId: string,
   tiers: { tier_from: number; tier_to: number | null; bonus_amount: number }[],
 ): Promise<ActionResult> {
-  if (!await requireOwner()) return { success: false, error: 'Недостаточно прав' }
-  const admin = createAdminClient()
+  if (!await isOwner()) return { success: false, error: 'Недостаточно прав' }
 
-  const { error: delErr } = await admin.from('kpi_bonus_tiers').delete().eq('block_id', blockId)
-  if (delErr) return { success: false, error: delErr.message }
-
-  if (tiers.length > 0) {
-    const rows = tiers.map((t, i) => ({
-      block_id:     blockId,
-      tier_from:    t.tier_from,
-      tier_to:      t.tier_to,
-      bonus_amount: t.bonus_amount,
-      sort_order:   i,
-    }))
-    const { error: insErr } = await admin.from('kpi_bonus_tiers').insert(rows)
-    if (insErr) return { success: false, error: insErr.message }
+  try {
+    await transaction(async (client) => {
+      await client.query('DELETE FROM public.kpi_bonus_tiers WHERE block_id = $1', [blockId])
+      for (const [i, t] of tiers.entries()) {
+        await client.query(
+          `INSERT INTO public.kpi_bonus_tiers (block_id, tier_from, tier_to, bonus_amount, sort_order)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [blockId, t.tier_from, t.tier_to, t.bonus_amount, i],
+        )
+      }
+    })
+  } catch (e) {
+    const err = e as { message?: string }
+    return { success: false, error: err.message ?? 'Ошибка сохранения' }
   }
 
   revalidatePath('/dashboard/settings')
@@ -197,25 +210,36 @@ export async function createBonusBlock(
   valueLabelTo: string,
   sortOrder: number,
 ): Promise<{ success: true; id: string } | { success: false; error: string }> {
-  if (!await requireOwner()) return { success: false, error: 'Недостаточно прав' }
-  const admin = createAdminClient()
-  const { data, error } = await admin
-    .from('kpi_bonus_blocks')
-    .insert({ role_setting_id: roleSettingId, name, block_type: 'custom', value_label_from: valueLabelFrom, value_label_to: valueLabelTo, sort_order: sortOrder })
-    .select('id')
-    .single()
-  if (error || !data) return { success: false, error: error?.message ?? 'Ошибка создания блока' }
+  if (!await isOwner()) return { success: false, error: 'Недостаточно прав' }
+
+  let created: { id: string } | null
+  try {
+    created = await queryOne<{ id: string }>(
+      `INSERT INTO public.kpi_bonus_blocks
+         (role_setting_id, name, block_type, value_label_from, value_label_to, sort_order)
+       VALUES ($1, $2, 'custom', $3, $4, $5)
+       RETURNING id`,
+      [roleSettingId, name, valueLabelFrom, valueLabelTo, sortOrder],
+    )
+  } catch (e) {
+    const err = e as { message?: string }
+    return { success: false, error: err.message ?? 'Ошибка создания блока' }
+  }
+  if (!created) return { success: false, error: 'Ошибка создания блока' }
   revalidatePath('/dashboard/settings')
-  return { success: true, id: data.id as string }
+  return { success: true, id: created.id }
 }
 
 // ─── Удалить блок бонусов (CASCADE удалит тиры) ───────────────────────────────
 
 export async function deleteBonusBlock(blockId: string): Promise<ActionResult> {
-  if (!await requireOwner()) return { success: false, error: 'Недостаточно прав' }
-  const admin = createAdminClient()
-  const { error } = await admin.from('kpi_bonus_blocks').delete().eq('id', blockId)
-  if (error) return { success: false, error: error.message }
+  if (!await isOwner()) return { success: false, error: 'Недостаточно прав' }
+  try {
+    await query('DELETE FROM public.kpi_bonus_blocks WHERE id = $1', [blockId])
+  } catch (e) {
+    const err = e as { message?: string }
+    return { success: false, error: err.message ?? 'Ошибка удаления блока' }
+  }
   revalidatePath('/dashboard/settings')
   return { success: true }
 }
@@ -226,24 +250,25 @@ export async function saveKpiItems(
   roleSettingId: string,
   items: { name: string; description: string | null; bonus_amount: number }[],
 ): Promise<ActionResult> {
-  if (!await requireOwner()) return { success: false, error: 'Недостаточно прав' }
-  const admin = createAdminClient()
-
-  const { error: delErr } = await admin.from('kpi_items').delete().eq('role_setting_id', roleSettingId)
-  if (delErr) return { success: false, error: delErr.message }
+  if (!await isOwner()) return { success: false, error: 'Недостаточно прав' }
 
   const validItems = items.filter(it => it.name.trim())
-  if (validItems.length > 0) {
-    const rows = validItems.map((it, i) => ({
-      role_setting_id: roleSettingId,
-      name:            it.name.trim(),
-      description:     it.description?.trim() || null,
-      bonus_amount:    it.bonus_amount,
-      sort_order:      i,
-      is_active:       true,
-    }))
-    const { error: insErr } = await admin.from('kpi_items').insert(rows)
-    if (insErr) return { success: false, error: insErr.message }
+
+  try {
+    await transaction(async (client) => {
+      await client.query('DELETE FROM public.kpi_items WHERE role_setting_id = $1', [roleSettingId])
+      for (const [i, it] of validItems.entries()) {
+        await client.query(
+          `INSERT INTO public.kpi_items
+             (role_setting_id, name, description, bonus_amount, sort_order, is_active)
+           VALUES ($1, $2, $3, $4, $5, TRUE)`,
+          [roleSettingId, it.name.trim(), it.description?.trim() || null, it.bonus_amount, i],
+        )
+      }
+    })
+  } catch (e) {
+    const err = e as { message?: string }
+    return { success: false, error: err.message ?? 'Ошибка сохранения KPI-пунктов' }
   }
 
   revalidatePath('/dashboard/settings')

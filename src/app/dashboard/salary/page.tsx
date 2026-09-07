@@ -2,10 +2,9 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import { ChevronLeft, ChevronRight } from 'lucide-react'
-import { createClient } from '@/lib/supabase/client'
+import { getSalaries, type SalaryRow } from '@/actions/salary'
 import { Button } from '@/components/ui/button'
 
-type SalaryRow = { employee_id: string; base_salary: number; kpi_bonus: number; bonuses: number; deductions: number; total_amount: number; advance_amount: number; status: string; employees: { name: string; role: string } | null }
 const months = ['январь', 'февраль', 'март', 'апрель', 'май', 'июнь', 'июль', 'август', 'сентябрь', 'октябрь', 'ноябрь', 'декабрь']
 
 export default function SalaryPage() {
@@ -16,8 +15,8 @@ export default function SalaryPage() {
   const month = current.getMonth() + 1
   const load = useCallback(async () => {
     setLoading(true)
-    const { data } = await createClient().from('salaries').select('employee_id, base_salary, kpi_bonus, bonuses, deductions, total_amount, advance_amount, status, employees(name, role)').eq('period_year', year).eq('period_month', month).order('total_amount', { ascending: false })
-    setRows((data ?? []) as unknown as SalaryRow[])
+    const data = await getSalaries(year, month)
+    setRows(data)
     setLoading(false)
   }, [year, month])
   useEffect(() => { void load() }, [load])

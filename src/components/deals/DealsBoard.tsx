@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from 'react'
 import { Plus, RefreshCw, Search } from 'lucide-react'
 import { toast } from 'sonner'
-import { createClient } from '@/lib/supabase/client'
 import { cn } from '@/lib/utils'
 import { formatMoney } from '@/lib/formatters'
 import type { Deal, DealEmployee, DealStage, DealViewer } from '@/types'
@@ -71,22 +70,15 @@ export default function DealsBoard({ initialStages, initialDeals, employees, me 
     setDeals(data.deals)
   }, [])
 
-  // ─── Realtime ──────────────────────────────────────────────────────────────
+  // ─── Обновление ──────────────────────────────────────────────────────────
+  // Раньше — Supabase Realtime-подписка на deals; на Postgres без Realtime —
+  // поллинг, с той же защитой от сбоя текущего перетаскивания.
   useEffect(() => {
-    const supabase = createClient()
-    let timer: ReturnType<typeof setTimeout> | null = null
-    const channel = supabase
-      .channel('deals-board')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'deals' }, () => {
-        if (dragIdRef.current) return // не мешаем текущему перетаскиванию
-        if (timer) clearTimeout(timer)
-        timer = setTimeout(refresh, 400)
-      })
-      .subscribe()
-    return () => {
-      if (timer) clearTimeout(timer)
-      supabase.removeChannel(channel)
-    }
+    const interval = setInterval(() => {
+      if (dragIdRef.current) return
+      refresh()
+    }, 5000)
+    return () => clearInterval(interval)
   }, [refresh])
 
   // ─── Фильтрация и раскладка по колонкам ────────────────────────────────────

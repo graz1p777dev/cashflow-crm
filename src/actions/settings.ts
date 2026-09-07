@@ -1,8 +1,8 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
-import { createClient } from '@/lib/supabase/server'
-import { createAdminClient } from '@/lib/supabase/admin'
+import { query, queryOne } from '@/lib/db'
+import { getActor } from '@/lib/auth/actor'
 import { recordAudit } from '@/actions/audit'
 
 export type ActionResult = { success: true } | { success: false; error: string }
@@ -42,11 +42,12 @@ export interface DealStageRow {
 }
 
 // ─── Auth guard ────────────────────────────────────────────────────────────────
+// Раньше requireSession() возвращал Supabase-сессию (RLS сам фильтровал
+// данные по политике «только вошедшие»). Теперь запросы идут напрямую, поэтому
+// проверка — как в employees.ts: есть ли действующий actor.
 
 async function requireSession() {
-  const supabase = await createClient()
-  const { data: { session } } = await supabase.auth.getSession()
-  return session
+  return getActor()
 }
 
 // ─── Departments ───────────────────────────────────────────────────────────────
@@ -54,26 +55,30 @@ async function requireSession() {
 export async function getDepartments(): Promise<DeptRow[]> {
   const session = await requireSession()
   if (!session) return []
-  const supabase = await createClient()
-  const { data } = await supabase
-    .from('departments')
-    .select('id, name, description, is_active')
-    .eq('is_active', true)
-    .order('name')
-  return (data ?? []) as DeptRow[]
+  return query<DeptRow>(
+    `SELECT id, name, description, is_active
+       FROM public.departments
+      WHERE is_active = TRUE
+      ORDER BY name`,
+  )
 }
 
 export async function createDepartment(name: string, description: string): Promise<ActionResult> {
   if (!name.trim()) return { success: false, error: 'Название обязательно' }
   const session = await requireSession()
   if (!session) return { success: false, error: 'Нет доступа' }
-  const admin = createAdminClient()
-  const { data: created, error } = await admin.from('departments').insert({
-    name: name.trim(),
-    description: description.trim() || null,
-    is_active: true,
-  }).select('id').maybeSingle()
-  if (error) return { success: false, error: error.message }
+  let created: { id: string } | null
+  try {
+    created = await queryOne<{ id: string }>(
+      `INSERT INTO public.departments (name, description, is_active)
+       VALUES ($1, $2, TRUE)
+       RETURNING id`,
+      [name.trim(), description.trim() || null],
+    )
+  } catch (e) {
+    const err = e as { code?: string; message?: string }
+    return { success: false, error: err.message ?? 'Ошибка создания отдела' }
+  }
   await recordAudit({ action: 'create', resourceType: 'department', resourceId: created?.id, summary: `Создан отдел «${name.trim()}»` })
   revalidatePath('/dashboard/settings')
   revalidatePath('/dashboard/employees')
@@ -84,13 +89,17 @@ export async function updateDepartment(id: string, name: string, description: st
   if (!name.trim()) return { success: false, error: 'Название обязательно' }
   const session = await requireSession()
   if (!session) return { success: false, error: 'Нет доступа' }
-  const admin = createAdminClient()
-  const { error } = await admin.from('departments').update({
-    name: name.trim(),
-    description: description.trim() || null,
-    updated_at: new Date().toISOString(),
-  }).eq('id', id)
-  if (error) return { success: false, error: error.message }
+  try {
+    await query(
+      `UPDATE public.departments
+          SET name = $2, description = $3, updated_at = NOW()
+        WHERE id = $1`,
+      [id, name.trim(), description.trim() || null],
+    )
+  } catch (e) {
+    const err = e as { code?: string; message?: string }
+    return { success: false, error: err.message ?? 'Ошибка изменения отдела' }
+  }
   await recordAudit({ action: 'update', resourceType: 'department', resourceId: id, summary: `Изменён отдел «${name.trim()}»` })
   revalidatePath('/dashboard/settings')
   revalidatePath('/dashboard/employees')
@@ -100,17 +109,25 @@ export async function updateDepartment(id: string, name: string, description: st
 export async function deleteDepartment(id: string): Promise<ActionResult> {
   const session = await requireSession()
   if (!session) return { success: false, error: 'Нет доступа' }
-  const admin = createAdminClient()
-  const { count } = await admin.from('employees')
-    .select('id', { count: 'exact', head: true })
-    .eq('department_id', id)
-    .is('deleted_at', null)
-  if (count && count > 0) {
+  const countRow = await queryOne<{ count: string }>(
+    `SELECT COUNT(*) AS count FROM public.employees
+      WHERE department_id = $1 AND deleted_at IS NULL`,
+    [id],
+  )
+  const count = Number(countRow?.count ?? 0)
+  if (count > 0) {
     return { success: false, error: `Нельзя удалить: к этому отделу привязаны сотрудники (${count} чел.) — сначала переведите их в другой отдел` }
   }
-  const { data: removed } = await admin.from('departments').select('name').eq('id', id).maybeSingle()
-  const { error } = await admin.from('departments').delete().eq('id', id)
-  if (error) return { success: false, error: error.message }
+  const removed = await queryOne<{ name: string }>(
+    'SELECT name FROM public.departments WHERE id = $1 LIMIT 1',
+    [id],
+  )
+  try {
+    await query('DELETE FROM public.departments WHERE id = $1', [id])
+  } catch (e) {
+    const err = e as { code?: string; message?: string }
+    return { success: false, error: err.message ?? 'Ошибка удаления отдела' }
+  }
   await recordAudit({ action: 'delete', resourceType: 'department', resourceId: id, summary: `Удалён отдел «${removed?.name ?? ''}»` })
   revalidatePath('/dashboard/settings')
   revalidatePath('/dashboard/employees')
@@ -122,13 +139,12 @@ export async function deleteDepartment(id: string): Promise<ActionResult> {
 export async function getRoles(): Promise<RoleRow[]> {
   const session = await requireSession()
   if (!session) return []
-  const supabase = await createClient()
-  const { data } = await supabase
-    .from('roles')
-    .select('id, name, label, description, is_system, permission_level')
-    .is('deleted_at', null)
-    .order('created_at')
-  return (data ?? []) as RoleRow[]
+  return query<RoleRow>(
+    `SELECT id, name, label, description, is_system, permission_level
+       FROM public.roles
+      WHERE deleted_at IS NULL
+      ORDER BY created_at`,
+  )
 }
 
 export async function createRole(
@@ -142,15 +158,16 @@ export async function createRole(
   if (!slug) return { success: false, error: 'Системное имя должно содержать латинские буквы' }
   const session = await requireSession()
   if (!session) return { success: false, error: 'Нет доступа' }
-  const admin = createAdminClient()
-  const { error } = await admin.from('roles').insert({
-    name: slug,
-    label: label.trim(),
-    description: description.trim() || null,
-    permission_level: permissionLevel,
-    is_system: false,
-  })
-  if (error) return { success: false, error: error.message }
+  try {
+    await query(
+      `INSERT INTO public.roles (name, label, description, permission_level, is_system)
+       VALUES ($1, $2, $3, $4, FALSE)`,
+      [slug, label.trim(), description.trim() || null, permissionLevel],
+    )
+  } catch (e) {
+    const err = e as { code?: string; message?: string }
+    return { success: false, error: err.message ?? 'Ошибка создания роли' }
+  }
   await recordAudit({ action: 'create', resourceType: 'role', summary: `Создана роль «${label.trim()}»` })
   revalidatePath('/dashboard/settings')
   revalidatePath('/dashboard/employees')
@@ -166,17 +183,34 @@ export async function updateRole(
   if (!label.trim()) return { success: false, error: 'Название роли обязательно' }
   const session = await requireSession()
   if (!session) return { success: false, error: 'Нет доступа' }
-  const admin = createAdminClient()
-  const { data: role } = await admin.from('roles').select('is_system').eq('id', id).single()
-  const updates: Record<string, unknown> = {
+  const role = await queryOne<{ is_system: boolean }>(
+    'SELECT is_system FROM public.roles WHERE id = $1 LIMIT 1',
+    [id],
+  )
+  try {
     // Системные роли: label заблокирован — он отображает name-slug в UI, изменение сломает ориентацию
-    ...(role?.is_system ? {} : { label: label.trim() }),
-    description: description.trim() || null,
-    updated_at: new Date().toISOString(),
+    if (role?.is_system) {
+      await query(
+        `UPDATE public.roles SET description = $2, updated_at = NOW() WHERE id = $1`,
+        [id, description.trim() || null],
+      )
+    } else if (permissionLevel) {
+      await query(
+        `UPDATE public.roles
+            SET label = $2, description = $3, permission_level = $4, updated_at = NOW()
+          WHERE id = $1`,
+        [id, label.trim(), description.trim() || null, permissionLevel],
+      )
+    } else {
+      await query(
+        `UPDATE public.roles SET label = $2, description = $3, updated_at = NOW() WHERE id = $1`,
+        [id, label.trim(), description.trim() || null],
+      )
+    }
+  } catch (e) {
+    const err = e as { code?: string; message?: string }
+    return { success: false, error: err.message ?? 'Ошибка изменения роли' }
   }
-  if (!role?.is_system && permissionLevel) updates.permission_level = permissionLevel
-  const { error } = await admin.from('roles').update(updates).eq('id', id)
-  if (error) return { success: false, error: error.message }
   await recordAudit({ action: 'update', resourceType: 'role', resourceId: id, summary: `Изменена роль «${label.trim()}»` })
   revalidatePath('/dashboard/settings')
   revalidatePath('/dashboard/employees')
@@ -186,18 +220,26 @@ export async function updateRole(
 export async function deleteRole(id: string): Promise<ActionResult> {
   const session = await requireSession()
   if (!session) return { success: false, error: 'Нет доступа' }
-  const admin = createAdminClient()
-  const { data: role } = await admin.from('roles').select('is_system, name').eq('id', id).single()
+  const role = await queryOne<{ is_system: boolean; name: string }>(
+    'SELECT is_system, name FROM public.roles WHERE id = $1 LIMIT 1',
+    [id],
+  )
   if (role?.is_system) return { success: false, error: 'Системные роли нельзя удалять' }
-  const { count } = await admin.from('employees')
-    .select('id', { count: 'exact', head: true })
-    .eq('role', role?.name ?? '')
-    .is('deleted_at', null)
-  if (count && count > 0) {
+  const countRow = await queryOne<{ count: string }>(
+    `SELECT COUNT(*) AS count FROM public.employees
+      WHERE role = $1 AND deleted_at IS NULL`,
+    [role?.name ?? ''],
+  )
+  const count = Number(countRow?.count ?? 0)
+  if (count > 0) {
     return { success: false, error: `Нельзя удалить: к этой роли привязаны сотрудники (${count} чел.) — сначала измените их роль` }
   }
-  const { error } = await admin.from('roles').delete().eq('id', id).eq('is_system', false)
-  if (error) return { success: false, error: error.message }
+  try {
+    await query('DELETE FROM public.roles WHERE id = $1 AND is_system = FALSE', [id])
+  } catch (e) {
+    const err = e as { code?: string; message?: string }
+    return { success: false, error: err.message ?? 'Ошибка удаления роли' }
+  }
   await recordAudit({ action: 'delete', resourceType: 'role', resourceId: id, summary: `Удалена роль «${role?.name ?? ''}»` })
   revalidatePath('/dashboard/settings')
   revalidatePath('/dashboard/employees')
@@ -209,27 +251,28 @@ export async function deleteRole(id: string): Promise<ActionResult> {
 export async function getWorkSchedules(): Promise<WorkScheduleRow[]> {
   const session = await requireSession()
   if (!session) return []
-  const supabase = await createClient()
-  const { data } = await supabase
-    .from('work_schedules')
-    .select('id, name, description, is_system, is_active')
-    .eq('is_active', true)
-    .order('created_at')
-  return (data ?? []) as WorkScheduleRow[]
+  return query<WorkScheduleRow>(
+    `SELECT id, name, description, is_system, is_active
+       FROM public.work_schedules
+      WHERE is_active = TRUE
+      ORDER BY created_at`,
+  )
 }
 
 export async function createWorkSchedule(name: string, description: string): Promise<ActionResult> {
   if (!name.trim()) return { success: false, error: 'Название обязательно' }
   const session = await requireSession()
   if (!session) return { success: false, error: 'Нет доступа' }
-  const admin = createAdminClient()
-  const { error } = await admin.from('work_schedules').insert({
-    name: name.trim(),
-    description: description.trim() || null,
-    is_system: false,
-    is_active: true,
-  })
-  if (error) return { success: false, error: error.message }
+  try {
+    await query(
+      `INSERT INTO public.work_schedules (name, description, is_system, is_active)
+       VALUES ($1, $2, FALSE, TRUE)`,
+      [name.trim(), description.trim() || null],
+    )
+  } catch (e) {
+    const err = e as { code?: string; message?: string }
+    return { success: false, error: err.message ?? 'Ошибка создания графика' }
+  }
   await recordAudit({ action: 'create', resourceType: 'work_schedule', summary: `Создан график «${name.trim()}»` })
   revalidatePath('/dashboard/settings')
   revalidatePath('/dashboard/employees')
@@ -240,13 +283,17 @@ export async function updateWorkSchedule(id: string, name: string, description: 
   if (!name.trim()) return { success: false, error: 'Название обязательно' }
   const session = await requireSession()
   if (!session) return { success: false, error: 'Нет доступа' }
-  const admin = createAdminClient()
-  const { error } = await admin.from('work_schedules').update({
-    name: name.trim(),
-    description: description.trim() || null,
-    updated_at: new Date().toISOString(),
-  }).eq('id', id)
-  if (error) return { success: false, error: error.message }
+  try {
+    await query(
+      `UPDATE public.work_schedules
+          SET name = $2, description = $3, updated_at = NOW()
+        WHERE id = $1`,
+      [id, name.trim(), description.trim() || null],
+    )
+  } catch (e) {
+    const err = e as { code?: string; message?: string }
+    return { success: false, error: err.message ?? 'Ошибка изменения графика' }
+  }
   await recordAudit({ action: 'update', resourceType: 'work_schedule', resourceId: id, summary: `Изменён график «${name.trim()}»` })
   revalidatePath('/dashboard/settings')
   revalidatePath('/dashboard/employees')
@@ -256,18 +303,26 @@ export async function updateWorkSchedule(id: string, name: string, description: 
 export async function deleteWorkSchedule(id: string): Promise<ActionResult> {
   const session = await requireSession()
   if (!session) return { success: false, error: 'Нет доступа' }
-  const admin = createAdminClient()
-  const { data: ws } = await admin.from('work_schedules').select('is_system, name').eq('id', id).single()
+  const ws = await queryOne<{ is_system: boolean; name: string }>(
+    'SELECT is_system, name FROM public.work_schedules WHERE id = $1 LIMIT 1',
+    [id],
+  )
   if (ws?.is_system) return { success: false, error: 'Системные графики нельзя удалять' }
-  const { count } = await admin.from('employees')
-    .select('id', { count: 'exact', head: true })
-    .eq('schedule_type', ws?.name ?? '')
-    .is('deleted_at', null)
-  if (count && count > 0) {
+  const countRow = await queryOne<{ count: string }>(
+    `SELECT COUNT(*) AS count FROM public.employees
+      WHERE schedule_type = $1 AND deleted_at IS NULL`,
+    [ws?.name ?? ''],
+  )
+  const count = Number(countRow?.count ?? 0)
+  if (count > 0) {
     return { success: false, error: `Нельзя удалить: этот график используют ${count} сотр. — сначала измените им график` }
   }
-  const { error } = await admin.from('work_schedules').delete().eq('id', id).eq('is_system', false)
-  if (error) return { success: false, error: error.message }
+  try {
+    await query('DELETE FROM public.work_schedules WHERE id = $1 AND is_system = FALSE', [id])
+  } catch (e) {
+    const err = e as { code?: string; message?: string }
+    return { success: false, error: err.message ?? 'Ошибка удаления графика' }
+  }
   await recordAudit({ action: 'delete', resourceType: 'work_schedule', resourceId: id, summary: `Удалён график «${ws?.name ?? ''}»` })
   revalidatePath('/dashboard/settings')
   revalidatePath('/dashboard/employees')
@@ -279,12 +334,11 @@ export async function deleteWorkSchedule(id: string): Promise<ActionResult> {
 export async function getDealStages(): Promise<DealStageRow[]> {
   const session = await requireSession()
   if (!session) return []
-  const supabase = await createClient()
-  const { data } = await supabase
-    .from('deal_stages')
-    .select('id, name, description, color, sort_order, kind, is_default')
-    .order('sort_order')
-  return (data ?? []) as DealStageRow[]
+  return query<DealStageRow>(
+    `SELECT id, name, description, color, sort_order, kind, is_default
+       FROM public.deal_stages
+      ORDER BY sort_order`,
+  )
 }
 
 /** Новые этапы всегда 'normal' — 'won'/'lost' зарезервированы под два
@@ -293,19 +347,22 @@ export async function createDealStage(name: string, description: string, color: 
   if (!name.trim()) return { success: false, error: 'Название обязательно' }
   const session = await requireSession()
   if (!session) return { success: false, error: 'Нет доступа' }
-  const admin = createAdminClient()
-  const { data: last } = await admin.from('deal_stages')
-    .select('sort_order').order('sort_order', { ascending: false }).limit(1).maybeSingle()
-  const nextOrder = ((last as { sort_order: number } | null)?.sort_order ?? 0) + 1
-  const { data: created, error } = await admin.from('deal_stages').insert({
-    name: name.trim(),
-    description: description.trim() || null,
-    color: color.trim() || '#94a3b8',
-    sort_order: nextOrder,
-    kind: 'normal',
-    is_default: false,
-  }).select('id').maybeSingle()
-  if (error) return { success: false, error: error.message }
+  const last = await queryOne<{ sort_order: number }>(
+    `SELECT sort_order FROM public.deal_stages ORDER BY sort_order DESC LIMIT 1`,
+  )
+  const nextOrder = (last?.sort_order ?? 0) + 1
+  let created: { id: string } | null
+  try {
+    created = await queryOne<{ id: string }>(
+      `INSERT INTO public.deal_stages (name, description, color, sort_order, kind, is_default)
+       VALUES ($1, $2, $3, $4, 'normal', FALSE)
+       RETURNING id`,
+      [name.trim(), description.trim() || null, color.trim() || '#94a3b8', nextOrder],
+    )
+  } catch (e) {
+    const err = e as { code?: string; message?: string }
+    return { success: false, error: err.message ?? 'Ошибка создания этапа' }
+  }
   await recordAudit({ action: 'create', resourceType: 'deal_stage', resourceId: created?.id, summary: `Создан этап воронки «${name.trim()}»` })
   revalidatePath('/dashboard/settings')
   revalidatePath('/dashboard/deals')
@@ -316,14 +373,17 @@ export async function updateDealStage(id: string, name: string, description: str
   if (!name.trim()) return { success: false, error: 'Название обязательно' }
   const session = await requireSession()
   if (!session) return { success: false, error: 'Нет доступа' }
-  const admin = createAdminClient()
-  const { error } = await admin.from('deal_stages').update({
-    name: name.trim(),
-    description: description.trim() || null,
-    color: color.trim() || '#94a3b8',
-    updated_at: new Date().toISOString(),
-  }).eq('id', id)
-  if (error) return { success: false, error: error.message }
+  try {
+    await query(
+      `UPDATE public.deal_stages
+          SET name = $2, description = $3, color = $4, updated_at = NOW()
+        WHERE id = $1`,
+      [id, name.trim(), description.trim() || null, color.trim() || '#94a3b8'],
+    )
+  } catch (e) {
+    const err = e as { code?: string; message?: string }
+    return { success: false, error: err.message ?? 'Ошибка изменения этапа' }
+  }
   await recordAudit({ action: 'update', resourceType: 'deal_stage', resourceId: id, summary: `Изменён этап воронки «${name.trim()}»` })
   revalidatePath('/dashboard/settings')
   revalidatePath('/dashboard/deals')
@@ -333,22 +393,30 @@ export async function updateDealStage(id: string, name: string, description: str
 export async function deleteDealStage(id: string): Promise<ActionResult> {
   const session = await requireSession()
   if (!session) return { success: false, error: 'Нет доступа' }
-  const admin = createAdminClient()
-  const { data: stage } = await admin.from('deal_stages').select('name, is_default').eq('id', id).maybeSingle()
+  const stage = await queryOne<{ name: string; is_default: boolean }>(
+    'SELECT name, is_default FROM public.deal_stages WHERE id = $1 LIMIT 1',
+    [id],
+  )
   if (!stage) return { success: false, error: 'Этап не найден' }
-  if ((stage as { is_default: boolean }).is_default) {
+  if (stage.is_default) {
     return { success: false, error: 'Этап по умолчанию нельзя удалить — в него попадают новые сделки' }
   }
-  const { count } = await admin.from('deals')
-    .select('id', { count: 'exact', head: true })
-    .eq('stage_id', id)
-    .is('deleted_at', null)
-  if (count && count > 0) {
+  const countRow = await queryOne<{ count: string }>(
+    `SELECT COUNT(*) AS count FROM public.deals
+      WHERE stage_id = $1 AND deleted_at IS NULL`,
+    [id],
+  )
+  const count = Number(countRow?.count ?? 0)
+  if (count > 0) {
     return { success: false, error: `Нельзя удалить: на этом этапе ${count} сделок(и) — сначала перенесите их на другой этап` }
   }
-  const { error } = await admin.from('deal_stages').delete().eq('id', id)
-  if (error) return { success: false, error: error.message }
-  await recordAudit({ action: 'delete', resourceType: 'deal_stage', resourceId: id, summary: `Удалён этап воронки «${(stage as { name: string }).name}»` })
+  try {
+    await query('DELETE FROM public.deal_stages WHERE id = $1', [id])
+  } catch (e) {
+    const err = e as { code?: string; message?: string }
+    return { success: false, error: err.message ?? 'Ошибка удаления этапа' }
+  }
+  await recordAudit({ action: 'delete', resourceType: 'deal_stage', resourceId: id, summary: `Удалён этап воронки «${stage.name}»` })
   revalidatePath('/dashboard/settings')
   revalidatePath('/dashboard/deals')
   return { success: true }

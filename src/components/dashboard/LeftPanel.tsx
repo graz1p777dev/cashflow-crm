@@ -1,4 +1,3 @@
-import { createTokenClient } from '@/lib/supabase/token-client'
 import { getRuMonthName } from '@/lib/formatters'
 import { getMonthKpiStats, getRevenueByWeeks, getPlanVsFactTable } from '@/lib/dashboard-queries'
 import MonthKpiCards from './MonthKpiCards'
@@ -14,24 +13,16 @@ interface LeftPanelProps {
   accessToken: string
 }
 
-export default async function LeftPanel({ year, month, employeeId, role, permissionLevel, accessToken }: LeftPanelProps) {
-  // Используем token-клиент вместо createClient() + cookies(),
-  // так как cookies() нельзя вызывать внутри Suspense во время стриминга.
-  //
-  // ВАЖНО: accessToken не должен передаваться в дочерние Client Components,
-  // и этот файл не должен получать директиву 'use client' —
-  // иначе токен попадёт в JS-бандл и станет виден в браузере.
-  const supabase = createTokenClient(accessToken)
-
+export default async function LeftPanel({ year, month, employeeId, role, permissionLevel }: LeftPanelProps) {
   // Используем permissionLevel для фильтрации — поддерживает пользовательские роли.
   // Фолбэк на имя роли для обратной совместимости (если permissionLevel не передан).
   const effectiveLevel = permissionLevel ?? (role === 'mp' || role === 'lmai' ? 'employee' : role === 'rop' ? 'department_head' : 'owner')
   const filterById = effectiveLevel === 'employee' ? employeeId : undefined
 
   const [stats, weeks, tableRows] = await Promise.all([
-    getMonthKpiStats(supabase, year, month, filterById),
-    getRevenueByWeeks(supabase, year, month, filterById),
-    getPlanVsFactTable(supabase, year, month, filterById),
+    getMonthKpiStats(year, month, filterById),
+    getRevenueByWeeks(year, month, filterById),
+    getPlanVsFactTable(year, month, filterById),
   ])
 
   const monthName = getRuMonthName(month)

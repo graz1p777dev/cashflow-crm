@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Plus, Search, UserRound, Users } from 'lucide-react'
 import { toast } from 'sonner'
-import { createClient } from '@/lib/supabase/client'
 import { cn } from '@/lib/utils'
 import type {
   TaskWithRelations,
@@ -55,27 +54,20 @@ export default function TasksBoard({ initialTasks, employees, departments, me }:
     return m
   }, [employees])
 
-  // ─── Realtime: живое обновление у всех открытых пользователей ───────────────
+  // ─── Обновление: живое обновление у всех открытых пользователей ───────────
+  // Раньше — Supabase Realtime-подписка на tasks; на Postgres без Realtime —
+  // поллинг, с той же защитой от сбоя текущего перетаскивания.
   const refresh = useCallback(async () => {
     const data = await getTasksData()
     setTasks(data.tasks)
   }, [])
 
   useEffect(() => {
-    const supabase = createClient()
-    let timer: ReturnType<typeof setTimeout> | null = null
-    const channel = supabase
-      .channel('tasks-board')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'tasks' }, () => {
-        if (dragIdRef.current) return // не мешаем текущему перетаскиванию
-        if (timer) clearTimeout(timer)
-        timer = setTimeout(refresh, 400)
-      })
-      .subscribe()
-    return () => {
-      if (timer) clearTimeout(timer)
-      supabase.removeChannel(channel)
-    }
+    const interval = setInterval(() => {
+      if (dragIdRef.current) return
+      refresh()
+    }, 5000)
+    return () => clearInterval(interval)
   }, [refresh])
 
   // ─── Фильтрация ────────────────────────────────────────────────────────────

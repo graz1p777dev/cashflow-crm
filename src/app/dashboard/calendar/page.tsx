@@ -1,4 +1,4 @@
-import { createClient } from '@/lib/supabase/server'
+import { query } from '@/lib/db'
 import CalendarAnalytics from './CalendarAnalytics'
 
 type SearchParams = Promise<{ month?: string }>
@@ -32,14 +32,44 @@ export default async function CalendarPage({ searchParams }: { searchParams: Sea
   const daysInMonth = new Date(year, monthNumber, 0).getDate()
   const from = `${month}-01`
   const to = `${month}-${String(daysInMonth).padStart(2, '0')}`
-  const supabase = await createClient()
 
-  const [activityResult, consultationsResult, marketingResult, financeResult, planResult] = await Promise.all([
-    supabase.from('daily_activity').select('date, fv_fact, sales_fact, revenue_fact, leads_fact, appeals_fact').gte('date', from).lte('date', to),
-    supabase.from('consultations').select('date, actual_status, status_after_fv, amount').gte('date', from).lte('date', to).is('deleted_at', null),
-    supabase.from('marketing_daily_data').select('date, active_campaigns, budget, ad_appeals').gte('date', from).lte('date', to),
-    supabase.from('finance_transactions').select('date, type, amount').gte('date', from).lte('date', to).is('deleted_at', null),
-    supabase.from('company_plans').select('date_start, date_end, target_revenue').lte('date_start', to).gte('date_end', from),
+  // marketing_daily_data не существует в живой БД (db/MIGRATION_PLAN.md,
+  // db/schema.sql §22) — запрос ниже осознанно повторяет прежнее поведение
+  // (тихий сбой под Supabase), теперь как ошибка Postgres, перехватываемая так же.
+  const [activityRows, consultationsRows, marketingRows, financeRows, planRows] = await Promise.all([
+    query<{ date: string; fv_fact: number | null; sales_fact: number | null; revenue_fact: number | null; leads_fact: number | null; appeals_fact: number | null }>(
+      `SELECT date, fv_fact, sales_fact, revenue_fact, leads_fact, appeals_fact
+         FROM public.daily_activity
+        WHERE date >= $1 AND date <= $2`,
+      [from, to],
+    ),
+    query<{ date: string; actual_status: boolean | null; status_after_fv: string | null; amount: number | null }>(
+      `SELECT date, actual_status, status_after_fv, amount
+         FROM public.consultations
+        WHERE date >= $1 AND date <= $2 AND deleted_at IS NULL`,
+      [from, to],
+    ),
+    query<{ date: string; active_campaigns: number | null; budget: number | null; ad_appeals: number | null }>(
+      `SELECT date, active_campaigns, budget, ad_appeals
+         FROM public.marketing_daily_data
+        WHERE date >= $1 AND date <= $2`,
+      [from, to],
+    ).catch((e) => {
+      console.error('[CalendarPage] marketing_daily_data query failed (table missing):', e instanceof Error ? e.message : e)
+      return []
+    }),
+    query<{ date: string; type: string; amount: number | null }>(
+      `SELECT date, type, amount
+         FROM public.finance_transactions
+        WHERE date >= $1 AND date <= $2 AND deleted_at IS NULL`,
+      [from, to],
+    ),
+    query<{ date_start: string; date_end: string; target_revenue: number | null }>(
+      `SELECT date_start, date_end, target_revenue
+         FROM public.company_plans
+        WHERE date_start <= $2 AND date_end >= $1`,
+      [from, to],
+    ),
   ])
 
   const facts = new Map<string, DayAnalytics>()
@@ -55,7 +85,7 @@ export default async function CalendarPage({ searchParams }: { searchParams: Sea
   }
 
   const activityOverrides = new Map<string, { fv: boolean; sales: boolean; revenue: boolean }>()
-  for (const row of activityResult.data ?? []) {
+  for (const row of activityRows) {
     const day = entry(row.date as string)
     activityOverrides.set(row.date as string, {
       fv: row.fv_fact !== null,
@@ -69,7 +99,7 @@ export default async function CalendarPage({ searchParams }: { searchParams: Sea
     day.appeals += Number(row.appeals_fact) || 0
   }
 
-  for (const row of consultationsResult.data ?? []) {
+  for (const row of consultationsRows) {
     const date = row.date as string
     const day = entry(date)
     const override = activityOverrides.get(date)
@@ -83,20 +113,20 @@ export default async function CalendarPage({ searchParams }: { searchParams: Sea
     }
   }
 
-  for (const row of marketingResult.data ?? []) {
+  for (const row of marketingRows) {
     const day = entry(row.date as string)
     day.adBudget += Number(row.budget) || 0
     day.appeals += Number(row.ad_appeals) || 0
     day.activeCampaigns += Number(row.active_campaigns) || 0
   }
 
-  for (const row of financeResult.data ?? []) {
+  for (const row of financeRows) {
     const day = entry(row.date as string)
     if (row.type === 'income') day.income += Number(row.amount) || 0
     if (row.type === 'expense') day.expense += Number(row.amount) || 0
   }
 
-  for (const plan of planResult.data ?? []) {
+  for (const plan of planRows) {
     const planStart = new Date(`${plan.date_start}T00:00:00`)
     const planEnd = new Date(`${plan.date_end}T00:00:00`)
     const planDays = Math.max(1, Math.round((planEnd.getTime() - planStart.getTime()) / 86_400_000) + 1)

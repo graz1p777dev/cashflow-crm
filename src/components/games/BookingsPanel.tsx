@@ -116,7 +116,7 @@ export default function BookingsPanel({ game, bookings, canDelete, onClose, onCh
         </div>
 
         {adding && (
-          <div className="grid grid-cols-[1fr_1fr_80px_auto] items-end gap-2 border-b border-gray-100 px-6 py-3">
+          <div className="grid grid-cols-1 items-end gap-2 border-b border-gray-100 px-6 py-3 sm:grid-cols-[1fr_1fr_80px_auto]">
             <div className="space-y-1">
               <Label>Имя</Label>
               <Input value={name} onChange={(e) => setName(e.target.value)} />

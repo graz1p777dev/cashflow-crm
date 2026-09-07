@@ -2,7 +2,6 @@ import Link from 'next/link'
 import {
   Bell, BellRing, CalendarClock, ListChecks, Target, TimerOff, UserCheck,
 } from 'lucide-react'
-import { createTokenClient } from '@/lib/supabase/token-client'
 import {
   getMonthKpiStats,
   getTaskSummary,
@@ -29,25 +28,19 @@ export default async function OpsSection({
   role,
   permissionLevel,
   employeeId,
-  accessToken,
 }: OpsSectionProps) {
-  // Тот же token-клиент, что в Left/RightPanel: cookies() внутри Suspense
-  // во время стриминга вызывать нельзя, а accessToken дальше в клиентские
-  // компоненты не уходит — этот файл серверный и таким должен остаться.
-  const supabase = createTokenClient(accessToken)
-
   const effectiveLevel =
     permissionLevel ??
     (role === 'mp' || role === 'lmai' ? 'employee' : role === 'rop' ? 'department_head' : 'owner')
   const filterById = effectiveLevel === 'employee' ? employeeId : undefined
 
   const [tasks, unread, kpi] = await Promise.all([
-    getTaskSummary(supabase, dateStr, employeeId),
-    getUnreadNotificationsCount(supabase, employeeId),
+    getTaskSummary(dateStr, employeeId),
+    getUnreadNotificationsCount(employeeId),
     // Тот же запрос делает LeftPanel для KPI-карточек. Здесь он нужен под
     // другой вопрос — «сколько процентов плана уже сделано», — а панели
     // стримятся независимыми Suspense-границами и общий кэш им не поделить.
-    getMonthKpiStats(supabase, year, month, filterById),
+    getMonthKpiStats(year, month, filterById),
   ])
 
   return (

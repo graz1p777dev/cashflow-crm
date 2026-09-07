@@ -1,6 +1,5 @@
 'use client'
-import { useEffect, useState, useMemo } from 'react'
-import { createClient } from '@/lib/supabase/client'
+import { useState } from 'react'
 import type { LiveFeedItem } from '@/types'
 import { STATUS_AFTER_FV_MAP, ACTUAL_STATUS_MAP, CONSULTATION_STATUS_MAP } from '@/lib/constants'
 import { formatTime, formatMoney } from '@/lib/formatters'
@@ -86,56 +85,14 @@ function FeedRow({ item, isNew }: { item: LiveFeedItem; isNew?: boolean }) {
   )
 }
 
-export default function LiveFeed({ initialItems, dateStr, employeeId }: LiveFeedProps) {
-  const [items, setItems] = useState<LiveFeedItem[]>(initialItems)
-  const [newIds, setNewIds] = useState<Set<string>>(new Set())
-  const supabase = useMemo(() => createClient(), [])
-
-  // Realtime подписка
-  useEffect(() => {
-    const filter = employeeId
-      ? `manager_id=eq.${employeeId}`
-      : undefined
-
-    const channelConfig = {
-      event: 'INSERT' as const,
-      schema: 'public',
-      table: 'consultations',
-      ...(filter ? { filter } : {}),
-    }
-
-    const channel = supabase
-      .channel('live-feed')
-      .on('postgres_changes', channelConfig, (payload) => {
-        const newRow = payload.new as Record<string, unknown>
-        // Только события за сегодня
-        if (newRow.date !== dateStr) return
-
-        const newItem: LiveFeedItem = {
-          id: newRow.id as string,
-          time: (newRow.time as string | null) ?? '00:00',
-          client_name: newRow.client_name as string,
-          manager_name: '—',
-          status: (newRow.status_after_fv ?? newRow.actual_status ?? newRow.status) as LiveFeedItem['status'],
-          amount: Number(newRow.amount) || 0,
-          is_nv: Boolean(newRow.is_nv),
-        }
-
-        setItems(prev => [newItem, ...prev])
-        setNewIds(prev => new Set([...prev, newItem.id]))
-        // Убираем анимацию через 500ms
-        setTimeout(() => {
-          setNewIds(prev => {
-            const next = new Set(prev)
-            next.delete(newItem.id)
-            return next
-          })
-        }, 500)
-      })
-      .subscribe()
-
-    return () => { supabase.removeChannel(channel) }
-  }, [supabase, dateStr, employeeId])
+// Раньше эта лента обновлялась вживую через Supabase Realtime на INSERT в
+// consultations (модуль Sprint 4, не принят — см. CLAUDE.md). На Postgress
+// без Realtime строить под неиспользуемый модуль новую инфраструктуру не
+// стали: лента остаётся статичной с initialItems, обновляется при
+// перезагрузке страницы.
+export default function LiveFeed({ initialItems }: LiveFeedProps) {
+  const [items] = useState<LiveFeedItem[]>(initialItems)
+  const newIds: Set<string> = new Set()
 
   if (items.length === 0) {
     return (

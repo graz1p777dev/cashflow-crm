@@ -4,8 +4,9 @@
 // CRM только читает.
 
 import { NextResponse } from 'next/server'
-import { createAdminClient } from '@/lib/supabase/admin'
+import { query } from '@/lib/db'
 import { guardBotRequest, readJson } from '@/lib/public-api'
+import { notify } from '@/lib/notifications/notify'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
@@ -31,18 +32,36 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'direction must be in|out' }, { status: 400 })
   }
 
-  const admin = createAdminClient()
-  const { error } = await admin.from('bot_messages').insert({
-    chat_id: String(payload.chatId),
-    direction: payload.direction,
-    sender: payload.sender ?? (payload.direction === 'in' ? 'client' : 'bot'),
-    // Длинные простыни в карточке всё равно не читают, а таблицу раздувают.
-    text: text.slice(0, 4000),
-  })
-
-  if (error) {
-    console.error('public/messages insert failed', error.message)
+  try {
+    await query(
+      `INSERT INTO public.bot_messages (chat_id, direction, sender, text)
+       VALUES ($1, $2, $3, $4)`,
+      [
+        String(payload.chatId),
+        payload.direction,
+        payload.sender ?? (payload.direction === 'in' ? 'client' : 'bot'),
+        // Длинные простыни в карточке всё равно не читают, а таблицу раздувают.
+        text.slice(0, 4000),
+      ],
+    )
+  } catch (e) {
+    console.error('public/messages insert failed', e instanceof Error ? e.message : e)
     return NextResponse.json({ error: 'Database error' }, { status: 500 })
+  }
+
+  // Входящие от клиента менеджер видит в карточке сделки — отдельное
+  // уведомление не нужно. Ответы бота — обычные (не важные) уведомления,
+  // отдельно от важных game_booking. sourceId не передаём: bot_messages.id
+  // BIGSERIAL, а notifications.source_id — UUID.
+  if (payload.direction === 'out') {
+    await notify({
+      type: 'bot_message',
+      title: 'Ответ бота',
+      body: text.slice(0, 200),
+      actionUrl: '/dashboard/deals',
+      isImportant: false,
+      sourceType: 'bot_message',
+    })
   }
 
   return NextResponse.json({ ok: true })
